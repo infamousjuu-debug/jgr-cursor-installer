@@ -56,7 +56,7 @@ GEMINI_API_KEY    = ''      # ← Paste your key here before building the .exe
 GEMINI_MODEL      = 'gemini-3-pro-image-preview'
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QFrame, QGraphicsDropShadowEffect,
     QSizePolicy, QScrollArea, QFileDialog, QDialog, QComboBox,
     QGraphicsOpacityEffect, QLineEdit, QTextEdit, QProgressBar
@@ -1318,6 +1318,38 @@ def extract_cursors_from_archive(archive_path, extract_dir):
 
 
 # =============================================================================
+#  Cursor thumbnail helper
+# =============================================================================
+
+def _cursor_to_pixmap(filepath, size=32):
+    """Try to load a cursor file (.cur/.ani/.ico) as a QPixmap for preview.
+    Returns a QPixmap of the given size, or an empty QPixmap on failure."""
+    try:
+        ext = Path(filepath).suffix.lower()
+        img = None
+        with open(filepath, 'rb') as fh:
+            raw = fh.read()
+        if ext == '.ani':
+            img = _extract_first_frame_from_ani(raw)
+        if img is None:
+            try:
+                import io
+                img = Image.open(io.BytesIO(raw))
+            except Exception:
+                img = Image.open(filepath)
+        if img is not None:
+            img = img.convert('RGBA').resize((size, size),
+                Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS)
+            data = img.tobytes('raw', 'BGRA')
+            from PyQt5.QtGui import QImage, QPixmap
+            qimg = QImage(data, size, size, QImage.Format_ARGB32)
+            return QPixmap.fromImage(qimg)
+    except Exception:
+        pass
+    return QPixmap()
+
+
+# =============================================================================
 #  Threads
 # =============================================================================
 
@@ -1942,8 +1974,8 @@ class CursorCreatorDialog(QDialog):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._has_key = bool(GEMINI_API_KEY)
-        # Smaller window when key is pre-configured (no key input shown)
-        self.setFixedSize(480, 420 if self._has_key else 520)
+        # Taller to fit preview grid; smaller when key is pre-configured
+        self.setFixedSize(500, 540 if self._has_key else 620)
         self._drag_origin = None
         self._generated   = []
         self._build_ui()
@@ -2046,16 +2078,18 @@ class CursorCreatorDialog(QDialog):
         self._progress_lbl.setAlignment(Qt.AlignCenter)
         lay.addWidget(self._progress_lbl)
 
-        # Log area (shows each role as it completes)
-        self._log = QTextEdit()
-        self._log.setReadOnly(True)
-        self._log.setFont(QFont('Consolas', 8))
-        self._log.setFixedHeight(80)
-        self._log.setStyleSheet(
-            'QTextEdit{color:rgba(255,255,255,50);background:rgba(255,255,255,3);'
-            'border:1px solid rgba(255,255,255,10);border-radius:8px;padding:6px;}')
-        self._log.hide()
-        lay.addWidget(self._log)
+        # Preview grid (shows each generated cursor as a small icon)
+        self._preview_frame = QWidget()
+        self._preview_frame.setStyleSheet(
+            'background:rgba(255,255,255,3);border:1px solid rgba(255,255,255,10);border-radius:8px;')
+        self._preview_grid = QGridLayout(self._preview_frame)
+        self._preview_grid.setContentsMargins(8, 6, 8, 6)
+        self._preview_grid.setSpacing(4)
+        self._preview_frame.setFixedHeight(90)
+        self._preview_frame.hide()
+        lay.addWidget(self._preview_frame)
+        self._preview_col = 0
+        self._preview_row = 0
 
         # Generate button
         self._gen_btn = QPushButton('GENERATE CURSOR PACK')
@@ -2100,8 +2134,13 @@ class CursorCreatorDialog(QDialog):
         self._install_btn.hide()
         self._progress_bar.show()
         self._progress_bar.setValue(0)
-        self._log.show()
-        self._log.clear()
+        self._preview_frame.show()
+        # Clear old previews
+        while self._preview_grid.count():
+            w = self._preview_grid.takeAt(0).widget()
+            if w: w.deleteLater()
+        self._preview_col = 0
+        self._preview_row = 0
         self._generated = []
 
         out_dir = os.path.join(tempfile.gettempdir(), 'jgr_ai_cursors',
@@ -2122,30 +2161,144 @@ class CursorCreatorDialog(QDialog):
 
     def _on_role_done(self, role, filepath):
         self._generated.append(filepath)
-        self._log.append(f'  + {role}.cur')
+        # Add preview icon to the grid
+        cell = QWidget()
+        cell_lay = QVBoxLayout(cell)
+        cell_lay.setContentsMargins(2, 2, 2, 2)
+        cell_lay.setSpacing(1)
+        thumb = QLabel()
+        thumb.setFixedSize(28, 28)
+        thumb.setAlignment(Qt.AlignCenter)
+        thumb.setStyleSheet('background:transparent;border:none;')
+        pix = _cursor_to_pixmap(filepath, 28)
+        if not pix.isNull():
+            thumb.setPixmap(pix)
+        else:
+            thumb.setText('?')
+            thumb.setStyleSheet('color:rgba(255,255,255,40);background:transparent;')
+        lbl = QLabel(role)
+        lbl.setFont(QFont('Segoe UI', 6))
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet('color:rgba(255,255,255,50);background:transparent;')
+        cell_lay.addWidget(thumb, 0, Qt.AlignCenter)
+        cell_lay.addWidget(lbl, 0, Qt.AlignCenter)
+        self._preview_grid.addWidget(cell, self._preview_row, self._preview_col)
+        self._preview_col += 1
+        if self._preview_col >= 9:
+            self._preview_col = 0
+            self._preview_row += 1
 
     def _on_role_error(self, role, error_msg):
-        short = error_msg[:80] if len(error_msg) > 80 else error_msg
-        self._log.append(f'  x {role} — {short}')
+        # Show an X for failed roles
+        cell = QWidget()
+        cell_lay = QVBoxLayout(cell)
+        cell_lay.setContentsMargins(2, 2, 2, 2)
+        cell_lay.setSpacing(1)
+        x_lbl = QLabel('X')
+        x_lbl.setFixedSize(28, 28)
+        x_lbl.setAlignment(Qt.AlignCenter)
+        x_lbl.setFont(QFont('Segoe UI', 10, QFont.Bold))
+        x_lbl.setStyleSheet('color:rgba(255,80,80,150);background:transparent;')
+        x_lbl.setToolTip(f'{role}: {error_msg}')
+        lbl = QLabel(role)
+        lbl.setFont(QFont('Segoe UI', 6))
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet('color:rgba(255,80,80,80);background:transparent;')
+        cell_lay.addWidget(x_lbl, 0, Qt.AlignCenter)
+        cell_lay.addWidget(lbl, 0, Qt.AlignCenter)
+        self._preview_grid.addWidget(cell, self._preview_row, self._preview_col)
+        self._preview_col += 1
+        if self._preview_col >= 9:
+            self._preview_col = 0
+            self._preview_row += 1
 
     def _on_all_done(self, output_dir, ok_count, total):
         self._gen_btn.setEnabled(True)
         self._gen_btn.setText('GENERATE CURSOR PACK')
         self._progress_bar.setValue(100)
+        self._output_dir = output_dir
 
         if ok_count == 0:
             self._progress_lbl.setText('Generation failed — check your API key and try again')
             self._progress_lbl.setStyleSheet('color:rgba(255,100,100,200);background:transparent;')
         else:
+            # Auto-save to user's Documents/JGR Cursors folder
+            save_dir = self._save_to_documents(output_dir)
+            save_note = f'  (saved to {save_dir})' if save_dir else ''
             self._progress_lbl.setText(
-                f'Generated {ok_count}/{total} cursors in {output_dir}')
+                f'Generated {ok_count}/{total} cursors!{save_note}')
             self._progress_lbl.setStyleSheet('color:rgba(80,230,130,200);background:transparent;')
             self._install_btn.show()
+            self._install_btn.setText('INSTALL NOW')
+
+    def _save_to_documents(self, src_dir):
+        """Copy generated cursors to Documents/JGR Cursors/<theme> for the user."""
+        try:
+            docs = Path(os.path.expanduser('~/Documents'))
+            if not docs.exists():
+                docs = Path(os.path.expanduser('~'))
+            theme_name = Path(src_dir).name or 'AI Cursors'
+            save_dir = docs / 'JGR Cursors' / theme_name
+            save_dir.mkdir(parents=True, exist_ok=True)
+            for fp in self._generated:
+                dest = save_dir / Path(fp).name
+                shutil.copy2(fp, dest)
+            return str(save_dir)
+        except Exception:
+            return ''
 
     def _install_generated(self):
-        if self._generated:
-            self.cursors_created.emit(list(self._generated))
-            self.close()
+        """Directly install cursors to Windows (registry + SystemParametersInfo)."""
+        if not self._generated:
+            return
+        self._install_btn.setEnabled(False)
+        self._install_btn.setText('Installing...')
+        self._progress_lbl.setText('Applying cursors to Windows...')
+        self._progress_lbl.setStyleSheet('color:rgba(255,255,255,120);background:transparent;')
+        QApplication.processEvents()
+
+        try:
+            import winreg
+            INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+            installed = {}
+            for fp in self._generated:
+                role = Path(fp).stem  # e.g. 'Arrow', 'Hand', etc.
+                # Verify this is a valid cursor role
+                valid_roles = {k for k, _ in CURSOR_ROLES}
+                if role not in valid_roles:
+                    continue
+                dest = INSTALL_DIR / Path(fp).name
+                shutil.copy2(fp, dest)
+                installed[role] = str(dest)
+
+            if installed:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0,
+                                    winreg.KEY_SET_VALUE) as reg:
+                    winreg.SetValueEx(reg, '', 0, winreg.REG_SZ, 'JGR AI')
+                    for key, dest in installed.items():
+                        winreg.SetValueEx(reg, key, 0, winreg.REG_EXPAND_SZ, dest)
+                ctypes.windll.user32.SystemParametersInfoW(
+                    SPI_SETCURSORS, 0, None, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE)
+
+                self._install_btn.setText('INSTALLED!')
+                self._install_btn.setStyleSheet(
+                    'QPushButton{color:#000;background:#00e888;border:none;'
+                    'border-radius:9px;letter-spacing:1px;}')
+                self._progress_lbl.setText(
+                    f'Installed {len(installed)} cursors! Your new cursors are now active.')
+                self._progress_lbl.setStyleSheet('color:rgba(80,230,130,200);background:transparent;')
+                # Also send to main window so file list updates
+                self.cursors_created.emit(list(self._generated))
+            else:
+                self._install_btn.setEnabled(True)
+                self._install_btn.setText('INSTALL NOW')
+                self._progress_lbl.setText('No valid cursor roles found in generated files')
+                self._progress_lbl.setStyleSheet('color:rgba(255,100,100,200);background:transparent;')
+        except Exception as exc:
+            self._install_btn.setEnabled(True)
+            self._install_btn.setText('INSTALL NOW')
+            self._progress_lbl.setText(f'Install error: {exc}')
+            self._progress_lbl.setStyleSheet('color:rgba(255,100,100,200);background:transparent;')
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -2315,14 +2468,29 @@ class FileItem(QWidget):
         super().__init__(parent)
         self.filepath     = filepath
         self.from_archive = from_archive
-        self.setFixedHeight(44)
+        self.setFixedHeight(48)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self._apply_style(False)
 
         lay = QHBoxLayout(self); lay.setContentsMargins(8,0,8,0); lay.setSpacing(7)
 
+        # Preview thumbnail
+        self._thumb = QLabel()
+        self._thumb.setFixedSize(32, 32)
+        self._thumb.setStyleSheet('background:transparent;border:none;')
+        pix = _cursor_to_pixmap(filepath, 32)
+        if not pix.isNull():
+            self._thumb.setPixmap(pix)
+        else:
+            self._thumb.setText('?')
+            self._thumb.setAlignment(Qt.AlignCenter)
+            self._thumb.setStyleSheet(
+                'color:rgba(255,255,255,40);background:rgba(255,255,255,5);'
+                'border:1px solid rgba(255,255,255,15);border-radius:4px;')
+        lay.addWidget(self._thumb)
+
         self._combo = QComboBox()
-        self._combo.setFixedWidth(220); self._combo.setFixedHeight(27)
+        self._combo.setFixedWidth(200); self._combo.setFixedHeight(27)
         self._combo.setStyleSheet(COMBO_STYLE)
         self._combo.addItem('-- assign type --', '')
         for key, display in CURSOR_ROLES:
