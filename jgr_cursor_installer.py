@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JGR Cursor Installer  v2.1
+JGR Cursor Installer  v2.2
 Dark-themed cursor installer for Windows with smart auto-detection.
 Supports: .cur  .ani  .ico  .zip  .rar  .7z  .tar  .gz  .bz2  .xz
 """
@@ -21,7 +21,7 @@ import subprocess
 from pathlib import Path
 
 # ── Version & Auto-Update Config ─────────────────────────────────────────────
-APP_VERSION   = '2.1.0'
+APP_VERSION   = '2.2.0'
 APP_NAME      = 'JGR Cursor Installer'
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -41,11 +41,20 @@ APP_NAME      = 'JGR Cursor Installer'
 UPDATE_CHECK_URL  = 'https://api.github.com/repos/infamousjuu-debug/jgr-cursor-installer/releases/latest'
 UPDATE_CHECK_SECS = 3600    # How often to re-check (seconds); default 1 hour
 
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  AI CURSOR CREATOR CONFIG  —  Uses Google Gemini to generate cursors    ║
+# ╠═══════════════════════════════════════════════════════════════════════════╣
+# ║  Get a free API key at: https://aistudio.google.com/apikey             ║
+# ║  Set the key here, or enter it in the app's Creator dialog.            ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+GEMINI_API_KEY    = ''      # ← Paste your Gemini API key here (or enter in-app)
+GEMINI_MODEL      = 'gemini-2.0-flash-preview-image-generation'
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFrame, QGraphicsDropShadowEffect,
     QSizePolicy, QScrollArea, QFileDialog, QDialog, QComboBox,
-    QGraphicsOpacityEffect
+    QGraphicsOpacityEffect, QLineEdit, QTextEdit, QProgressBar
 )
 from PyQt5.QtCore import (
     Qt, QPoint, pyqtSignal, QThread, QTimer, QRect,
@@ -1555,6 +1564,412 @@ class UpdateBanner(QWidget):
 
 
 # =============================================================================
+#  AI CURSOR CREATOR  —  Generate full cursor packs from a text description
+# =============================================================================
+
+# Hotspot positions for each role (x, y on a 32x32 grid)
+_ROLE_HOTSPOTS = {
+    'Arrow':       (0, 0),    'Help':        (0, 0),
+    'AppStarting': (0, 0),    'Wait':        (16, 16),
+    'Cross':       (16, 16),  'IBeam':       (16, 16),
+    'SizeNWSE':    (16, 16),  'SizeNESW':    (16, 16),
+    'SizeWE':      (16, 16),  'SizeNS':      (16, 16),
+    'SizeAll':     (16, 16),  'No':          (16, 16),
+    'Hand':        (8, 0),    'UpArrow':     (16, 0),
+    'NWPen':       (0, 30),   'Pin':         (8, 30),
+    'Person':      (0, 0),
+}
+
+# How to describe each cursor for the AI prompt
+_ROLE_PROMPTS = {
+    'Arrow':       'a standard mouse pointer arrow, pointing upper-left',
+    'Help':        'a mouse pointer arrow with a small question mark next to it',
+    'AppStarting': 'a mouse pointer arrow with a small spinning loading icon',
+    'Wait':        'a spinning loading/busy indicator (hourglass or spinner circle)',
+    'Cross':       'a precise crosshair/plus-sign target reticle',
+    'IBeam':       'a text cursor I-beam (thin vertical line with serifs top and bottom)',
+    'SizeNWSE':    'a double-headed diagonal arrow going from top-left to bottom-right',
+    'SizeNESW':    'a double-headed diagonal arrow going from top-right to bottom-left',
+    'SizeWE':      'a double-headed horizontal arrow pointing left and right',
+    'SizeNS':      'a double-headed vertical arrow pointing up and down',
+    'SizeAll':     'a four-way arrow cross pointing in all 4 directions (move cursor)',
+    'No':          'a circle with a diagonal line through it (forbidden/not-allowed symbol)',
+    'Hand':        'a pointing hand cursor with index finger pointing up (link select)',
+    'UpArrow':     'an arrow pointing straight up',
+    'NWPen':       'a pen or pencil cursor tilted for handwriting',
+    'Pin':         'a map pin/location marker icon',
+    'Person':      'a small person/user silhouette icon',
+}
+
+# Roles to generate (the main 13 most packs use, plus extras)
+_GEN_ROLES_MAIN   = ['Arrow', 'Help', 'AppStarting', 'Wait', 'Cross', 'IBeam',
+                      'SizeNWSE', 'SizeNESW', 'SizeWE', 'SizeNS', 'SizeAll',
+                      'No', 'Hand']
+_GEN_ROLES_EXTRA  = ['UpArrow', 'NWPen', 'Pin', 'Person']
+
+
+def _build_cursor_prompt(theme_desc, role):
+    """Build a Gemini prompt for generating a single cursor image."""
+    shape_desc = _ROLE_PROMPTS.get(role, 'a mouse cursor icon')
+    return (
+        f"Generate a single 32x32 pixel cursor icon: {shape_desc}. "
+        f"Style/theme: {theme_desc}. "
+        f"Requirements: transparent background (PNG with alpha), "
+        f"clean pixel art at exactly 32x32 pixels, "
+        f"the icon should be clearly visible and recognizable as a cursor, "
+        f"use sharp edges suitable for a small icon. "
+        f"Output ONLY the image, no text."
+    )
+
+
+def _write_cur_file(img, hotspot, out_path):
+    """Write a PIL Image as a Windows .cur file."""
+    import io
+    img = img.convert('RGBA').resize((32, 32), Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS)
+    W, H = img.size
+    hx, hy = hotspot
+
+    # Build DIB (device-independent bitmap) for the cursor
+    pix = img.load()
+    xor_data = bytearray()
+    for y in range(H - 1, -1, -1):  # bottom-up
+        for x in range(W):
+            r, g, b, a = pix[x, y]
+            xor_data.extend([b, g, r, a])
+
+    # AND mask (1-bit, bottom-up, padded to 4-byte boundary)
+    and_row_bytes = ((W + 31) // 32) * 4
+    and_data = bytearray()
+    for y in range(H - 1, -1, -1):
+        row = bytearray(and_row_bytes)
+        for x in range(W):
+            a = pix[x, y][3]
+            if a < 128:
+                row[x // 8] |= (0x80 >> (x % 8))
+        and_data.extend(row)
+
+    # BITMAPINFOHEADER (40 bytes)
+    bih = struct.pack('<IiiHHIIiiII',
+        40,         # biSize
+        W,          # biWidth
+        H * 2,      # biHeight (XOR + AND)
+        1,          # biPlanes
+        32,         # biBitCount
+        0,          # biCompression
+        len(xor_data) + len(and_data),
+        0, 0, 0, 0)
+
+    dib = bih + bytes(xor_data) + bytes(and_data)
+
+    # .cur file structure
+    icon_dir_entry = struct.pack('<BBBBHHIH',
+        W if W < 256 else 0,
+        H if H < 256 else 0,
+        0,          # color count
+        0,          # reserved
+        hx,         # hotspot X
+        hy,         # hotspot Y
+        len(dib),   # data size
+        6 + 16)     # data offset (header=6, one entry=16)
+
+    header = struct.pack('<HHH', 0, 2, 1)  # reserved, type=CUR, count=1
+    with open(out_path, 'wb') as f:
+        f.write(header + icon_dir_entry + dib)
+
+
+def _gemini_generate_image(api_key, prompt, model=None):
+    """Call Gemini API to generate an image. Returns PIL Image or raises."""
+    import urllib.request, ssl, base64, io
+    model = model or GEMINI_MODEL
+    url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}'
+
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
+    })
+
+    req = urllib.request.Request(url, data=payload.encode(),
+        headers={'Content-Type': 'application/json'})
+    ctx = ssl.create_default_context()
+
+    with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+        data = json.loads(resp.read().decode())
+
+    # Extract image from response
+    for candidate in data.get('candidates', []):
+        for part in candidate.get('content', {}).get('parts', []):
+            if 'inlineData' in part:
+                b64 = part['inlineData']['data']
+                return Image.open(io.BytesIO(base64.b64decode(b64)))
+
+    raise RuntimeError('No image returned from Gemini')
+
+
+class CursorGeneratorThread(QThread):
+    """Background thread that generates all cursor images via Gemini."""
+    progress    = pyqtSignal(str, int, int)   # role, current, total
+    role_done   = pyqtSignal(str, str)        # role, filepath
+    error       = pyqtSignal(str, str)        # role, error message
+    all_done    = pyqtSignal(str, int, int)   # output_dir, success_count, total
+
+    def __init__(self, api_key, theme_desc, output_dir, include_extra=False):
+        super().__init__()
+        self.api_key     = api_key
+        self.theme_desc  = theme_desc
+        self.output_dir  = output_dir
+        self.roles       = list(_GEN_ROLES_MAIN)
+        if include_extra:
+            self.roles += _GEN_ROLES_EXTRA
+
+    def run(self):
+        os.makedirs(self.output_dir, exist_ok=True)
+        total = len(self.roles)
+        ok = 0
+
+        for i, role in enumerate(self.roles):
+            self.progress.emit(role, i + 1, total)
+            prompt = _build_cursor_prompt(self.theme_desc, role)
+            try:
+                img = _gemini_generate_image(self.api_key, prompt)
+                img = img.convert('RGBA').resize((32, 32),
+                    Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS)
+
+                fname = f'{role}.cur'
+                fpath = os.path.join(self.output_dir, fname)
+                hotspot = _ROLE_HOTSPOTS.get(role, (0, 0))
+                _write_cur_file(img, hotspot, fpath)
+
+                ok += 1
+                self.role_done.emit(role, fpath)
+            except Exception as exc:
+                self.error.emit(role, str(exc))
+
+        self.all_done.emit(self.output_dir, ok, total)
+
+
+class CursorCreatorDialog(QDialog):
+    """Dialog for generating AI cursor packs from a text description."""
+    cursors_created = pyqtSignal(list)  # list of generated .cur file paths
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(480, 520)
+        self._drag_origin = None
+        self._generated   = []
+        self._build_ui()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+
+        panel = QWidget(); panel.setObjectName('CreatorPanel')
+        panel.setStyleSheet(
+            'QWidget#CreatorPanel{background:rgba(12,12,16,248);'
+            'border-radius:16px;border:1px solid rgba(255,255,255,22);}')
+        glow = QGraphicsDropShadowEffect()
+        glow.setColor(QColor(255, 255, 255, 25))
+        glow.setBlurRadius(40); glow.setOffset(0, 0)
+        panel.setGraphicsEffect(glow)
+
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(22, 16, 22, 18); lay.setSpacing(10)
+
+        # Title
+        title_row = QHBoxLayout()
+        title = QLabel('AI CURSOR CREATOR')
+        title.setFont(QFont('Segoe UI', 14, QFont.Bold))
+        title.setStyleSheet('color:#fff;background:transparent;letter-spacing:3px;')
+        close_btn = QPushButton('X')
+        close_btn.setFixedSize(26, 26); close_btn.setFont(QFont('Segoe UI', 9))
+        close_btn.setStyleSheet(
+            'QPushButton{color:rgba(180,180,180,140);background:rgba(255,255,255,8);'
+            'border:1px solid rgba(255,255,255,18);border-radius:7px;}'
+            'QPushButton:hover{color:#ff4060;border-color:#ff4060;}')
+        close_btn.clicked.connect(self.close)
+        title_row.addWidget(title); title_row.addStretch(); title_row.addWidget(close_btn)
+        lay.addLayout(title_row)
+
+        sub = QLabel('Describe a theme and Gemini will generate all cursor images')
+        sub.setFont(QFont('Segoe UI', 8))
+        sub.setStyleSheet('color:rgba(255,255,255,50);background:transparent;')
+        sub.setWordWrap(True)
+        lay.addWidget(sub)
+
+        # API key input
+        key_lbl = QLabel('GEMINI API KEY')
+        key_lbl.setFont(QFont('Segoe UI', 7, QFont.Bold))
+        key_lbl.setStyleSheet('color:rgba(255,255,255,40);background:transparent;letter-spacing:2px;')
+        lay.addWidget(key_lbl)
+
+        self._key_input = QLineEdit()
+        self._key_input.setPlaceholderText('Paste your Gemini API key (from aistudio.google.com/apikey)')
+        self._key_input.setEchoMode(QLineEdit.Password)
+        if GEMINI_API_KEY:
+            self._key_input.setText(GEMINI_API_KEY)
+        self._key_input.setFont(QFont('Segoe UI', 9))
+        self._key_input.setFixedHeight(34)
+        self._key_input.setStyleSheet(
+            'QLineEdit{color:#fff;background:rgba(255,255,255,6);'
+            'border:1px solid rgba(255,255,255,20);border-radius:8px;padding:0 10px;}'
+            'QLineEdit:focus{border-color:rgba(255,255,255,50);}')
+        lay.addWidget(self._key_input)
+
+        # Theme input
+        theme_lbl = QLabel('THEME DESCRIPTION')
+        theme_lbl.setFont(QFont('Segoe UI', 7, QFont.Bold))
+        theme_lbl.setStyleSheet('color:rgba(255,255,255,40);background:transparent;letter-spacing:2px;')
+        lay.addWidget(theme_lbl)
+
+        self._theme_input = QTextEdit()
+        self._theme_input.setPlaceholderText(
+            'Describe your cursor style...\n\n'
+            'Examples:\n'
+            '  Neon blue cyberpunk with glowing edges\n'
+            '  Minimalist white outline on transparent\n'
+            '  Pixel art medieval fantasy RPG\n'
+            '  Cute pastel pink kawaii style')
+        self._theme_input.setFont(QFont('Segoe UI', 9))
+        self._theme_input.setFixedHeight(100)
+        self._theme_input.setStyleSheet(
+            'QTextEdit{color:#fff;background:rgba(255,255,255,6);'
+            'border:1px solid rgba(255,255,255,20);border-radius:8px;padding:8px;}'
+            'QTextEdit:focus{border-color:rgba(255,255,255,50);}')
+        lay.addWidget(self._theme_input)
+
+        # Progress area
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setFixedHeight(6)
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setTextVisible(False)
+        self._progress_bar.setStyleSheet(
+            'QProgressBar{background:rgba(255,255,255,8);border:none;border-radius:3px;}'
+            'QProgressBar::chunk{background:#fff;border-radius:3px;}')
+        self._progress_bar.hide()
+        lay.addWidget(self._progress_bar)
+
+        self._progress_lbl = QLabel('')
+        self._progress_lbl.setFont(QFont('Segoe UI', 8))
+        self._progress_lbl.setStyleSheet('color:rgba(255,255,255,60);background:transparent;')
+        self._progress_lbl.setAlignment(Qt.AlignCenter)
+        lay.addWidget(self._progress_lbl)
+
+        # Log area (shows each role as it completes)
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFont(QFont('Consolas', 8))
+        self._log.setFixedHeight(80)
+        self._log.setStyleSheet(
+            'QTextEdit{color:rgba(255,255,255,50);background:rgba(255,255,255,3);'
+            'border:1px solid rgba(255,255,255,10);border-radius:8px;padding:6px;}')
+        self._log.hide()
+        lay.addWidget(self._log)
+
+        # Generate button
+        self._gen_btn = QPushButton('GENERATE CURSOR PACK')
+        self._gen_btn.setFont(QFont('Segoe UI', 10, QFont.Bold))
+        self._gen_btn.setFixedHeight(42)
+        self._gen_btn.setStyleSheet(
+            'QPushButton{color:#000;background:#fff;border:none;border-radius:10px;letter-spacing:2px;}'
+            'QPushButton:hover{background:#e0e0e0;}'
+            'QPushButton:disabled{color:rgba(120,120,120,80);background:rgba(255,255,255,8);}')
+        self._gen_btn.clicked.connect(self._start_generation)
+        lay.addWidget(self._gen_btn)
+
+        # Install button (appears after generation)
+        self._install_btn = QPushButton('INSTALL GENERATED CURSORS')
+        self._install_btn.setFont(QFont('Segoe UI', 9, QFont.Bold))
+        self._install_btn.setFixedHeight(36)
+        self._install_btn.setStyleSheet(
+            'QPushButton{color:#000;background:qlineargradient(x1:0,y1:0,x2:1,y2:0,'
+            'stop:0 #00e888,stop:1 #00cc66);border:none;border-radius:9px;letter-spacing:1px;}'
+            'QPushButton:hover{background:#00cc66;}')
+        self._install_btn.clicked.connect(self._install_generated)
+        self._install_btn.hide()
+        lay.addWidget(self._install_btn)
+
+        root.addWidget(panel)
+
+    def _start_generation(self):
+        api_key = self._key_input.text().strip()
+        theme   = self._theme_input.toPlainText().strip()
+
+        if not api_key:
+            self._progress_lbl.setText('Please enter your Gemini API key')
+            self._progress_lbl.setStyleSheet('color:rgba(255,100,100,200);background:transparent;')
+            return
+        if not theme:
+            self._progress_lbl.setText('Please describe a cursor theme')
+            self._progress_lbl.setStyleSheet('color:rgba(255,100,100,200);background:transparent;')
+            return
+
+        self._gen_btn.setEnabled(False)
+        self._gen_btn.setText('Generating...')
+        self._install_btn.hide()
+        self._progress_bar.show()
+        self._progress_bar.setValue(0)
+        self._log.show()
+        self._log.clear()
+        self._generated = []
+
+        out_dir = os.path.join(tempfile.gettempdir(), 'jgr_ai_cursors',
+                               re.sub(r'[^\w\s-]', '', theme)[:30].strip())
+
+        self._gen_thread = CursorGeneratorThread(api_key, theme, out_dir, include_extra=True)
+        self._gen_thread.progress.connect(self._on_progress)
+        self._gen_thread.role_done.connect(self._on_role_done)
+        self._gen_thread.error.connect(self._on_role_error)
+        self._gen_thread.all_done.connect(self._on_all_done)
+        self._gen_thread.start()
+
+    def _on_progress(self, role, current, total):
+        pct = int(current / total * 100)
+        self._progress_bar.setValue(pct)
+        self._progress_lbl.setText(f'Generating {role}...  ({current}/{total})')
+        self._progress_lbl.setStyleSheet('color:rgba(255,255,255,120);background:transparent;')
+
+    def _on_role_done(self, role, filepath):
+        self._generated.append(filepath)
+        self._log.append(f'  + {role}.cur')
+
+    def _on_role_error(self, role, error_msg):
+        short = error_msg[:80] if len(error_msg) > 80 else error_msg
+        self._log.append(f'  x {role} — {short}')
+
+    def _on_all_done(self, output_dir, ok_count, total):
+        self._gen_btn.setEnabled(True)
+        self._gen_btn.setText('GENERATE CURSOR PACK')
+        self._progress_bar.setValue(100)
+
+        if ok_count == 0:
+            self._progress_lbl.setText('Generation failed — check your API key and try again')
+            self._progress_lbl.setStyleSheet('color:rgba(255,100,100,200);background:transparent;')
+        else:
+            self._progress_lbl.setText(
+                f'Generated {ok_count}/{total} cursors in {output_dir}')
+            self._progress_lbl.setStyleSheet('color:rgba(80,230,130,200);background:transparent;')
+            self._install_btn.show()
+
+    def _install_generated(self):
+        if self._generated:
+            self.cursors_created.emit(list(self._generated))
+            self.close()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_origin = e.globalPos() - self.frameGeometry().topLeft()
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.LeftButton and self._drag_origin:
+            self.move(e.globalPos() - self._drag_origin)
+    def mouseReleaseEvent(self, e):
+        self._drag_origin = None
+    def paintEvent(self, _):
+        pass
+
+
+# =============================================================================
 #  Cursor Sites dialog  (dark theme)
 # =============================================================================
 class SitesDialog(QDialog):
@@ -1974,9 +2389,12 @@ class MainWindow(QMainWindow):
                 'QPushButton:hover{color:'+hc+';background:rgba(255,255,255,12);border-color:'+hc+';}')
             return b
         br_btn  = abtn('  Select Files...','rgba(255,255,255,160)','#ffffff','rgba(255,255,255,30)')
-        sit_btn = abtn('Find Cursors Online','rgba(180,180,180,180)','#ffffff','rgba(255,255,255,22)')
-        br_btn.clicked.connect(self._browse); sit_btn.clicked.connect(self._open_sites)
-        btn_row.addWidget(br_btn); btn_row.addWidget(sit_btn)
+        sit_btn = abtn('Find Online','rgba(180,180,180,180)','#ffffff','rgba(255,255,255,22)')
+        ai_btn  = abtn('AI Create','rgba(180,230,180,200)','#00e888','rgba(100,230,130,40)')
+        br_btn.clicked.connect(self._browse)
+        sit_btn.clicked.connect(self._open_sites)
+        ai_btn.clicked.connect(self._open_creator)
+        btn_row.addWidget(br_btn); btn_row.addWidget(sit_btn); btn_row.addWidget(ai_btn)
 
         # List header
         hdr_row = QHBoxLayout(); hdr_row.setContentsMargins(0,0,0,0); hdr_row.setSpacing(6)
@@ -2122,6 +2540,12 @@ class MainWindow(QMainWindow):
     def _open_sites(self):
         dlg = SitesDialog(self)
         dlg.move(self.x()+(self.width()-dlg.sizeHint().width())//2, self.y()+110)
+        dlg.exec_()
+
+    def _open_creator(self):
+        dlg = CursorCreatorDialog(self)
+        dlg.cursors_created.connect(self._on_cursor_files)
+        dlg.move(self.x()+(self.width()-dlg.width())//2, self.y()+60)
         dlg.exec_()
 
     def _browse(self):
