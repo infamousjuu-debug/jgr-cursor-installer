@@ -7,22 +7,22 @@
 
   <style>
     :root {
-      --glass-bg: rgba(255, 255, 255, 0.07);
-      --glass-border: rgba(255, 255, 255, 0.15);
+      --glass-bg: rgba(255, 255, 255, 0.06);
+      --glass-border: rgba(255, 255, 255, 0.12);
       --accent: #ffffff;
-      --github-bg: rgba(255, 255, 255, 0.03);
+      --glow: rgba(255, 255, 255, 0.1);
     }
 
     body {
       margin: 0;
       padding: 0;
-      font-family: "Segoe UI Variable", "Segoe UI", Arial, sans-serif;
-      background: #0a0a0a;
-      /* Dynamic mesh background */
+      font-family: "Segoe UI Variable Display", "Segoe UI", sans-serif;
+      background: #050505;
+      /* High-contrast mesh gradient to show off the blur */
       background-image: 
-        radial-gradient(at 0% 0%, hsla(253,16%,7%,1) 0, transparent 50%), 
-        radial-gradient(at 50% 0%, hsla(225,39%,25%,1) 0, transparent 50%), 
-        radial-gradient(at 100% 0%, hsla(339,49%,20%,1) 0, transparent 50%);
+        radial-gradient(at 0% 0%, hsla(250,20%,10%,1) 0, transparent 50%), 
+        radial-gradient(at 100% 0%, hsla(340,30%,15%,1) 0, transparent 50%),
+        radial-gradient(at 50% 100%, hsla(220,40%,15%,1) 0, transparent 50%);
       min-height: 100vh;
       color: #fff;
       display: flex;
@@ -37,144 +37,75 @@
       z-index: 1;
       padding: 40px 20px;
       width: 100%;
-      max-width: 500px;
+      max-width: 480px;
     }
 
     h1 {
-      font-size: clamp(2.5rem, 8vw, 3.5rem);
-      margin-bottom: 5px;
+      font-size: clamp(2.5rem, 8vw, 3.8rem);
+      margin: 0;
       font-weight: 700;
-      letter-spacing: -1px;
+      letter-spacing: -2px;
+      background: linear-gradient(to bottom, #fff 60%, #888);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
     }
 
     .subtitle {
-      color: rgba(255, 255, 255, 0.6);
+      color: rgba(255, 255, 255, 0.5);
       font-size: 1.1rem;
-      margin-bottom: 30px;
+      margin-bottom: 40px;
+      font-weight: 400;
     }
 
-    /* Main Download Card */
+    /* Ultra-Transparent Card */
     .glass {
+      position: relative;
       padding: 40px;
       background: var(--glass-bg);
-      backdrop-filter: blur(25px) saturate(180%);
-      -webkit-backdrop-filter: blur(25px) saturate(180%);
-      border-radius: 24px;
+      backdrop-filter: blur(30px) saturate(200%);
+      -webkit-backdrop-filter: blur(30px) saturate(200%);
+      border-radius: 28px;
       border: 1px solid var(--glass-border);
-      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
-      margin-bottom: 20px;
+      box-shadow: 0 30px 60px rgba(0,0,0,0.6);
+      margin-bottom: 24px;
+      overflow: hidden;
     }
 
-    /* GitHub Box */
-    .github-box {
-      padding: 20px;
-      background: var(--github-bg);
-      backdrop-filter: blur(10px);
-      -webkit-backdrop-filter: blur(10px);
-      border-radius: 18px;
-      border: 1px solid rgba(255, 255, 255, 0.08);
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      text-decoration: none;
-      color: #fff;
-      transition: all 0.3s ease;
-    }
-
-    .github-box:hover {
-      background: rgba(255, 255, 255, 0.08);
-      border-color: rgba(255, 255, 255, 0.2);
-      transform: translateY(-2px);
-    }
-
-    .github-info {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      font-size: 0.9rem;
-      color: rgba(255, 255, 255, 0.8);
+    /* Subtle top light effect */
+    .glass::before {
+      content: "";
+      position: absolute;
+      top: 0; left: 0; right: 0; height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.3), transparent);
     }
 
     .btn {
       display: block;
-      padding: 18px 20px;
-      border-radius: 12px;
+      padding: 20px;
+      border-radius: 14px;
       background: var(--accent);
       color: #000;
       text-decoration: none;
       font-size: 1.1rem;
       font-weight: 700;
-      transition: all 0.2s ease;
+      transition: all 0.3s cubic-bezier(0.23, 1, 0.32, 1);
+      position: relative;
+      overflow: hidden;
     }
 
     .btn:hover {
-      background: #f0f0f0;
-      transform: scale(1.02);
+      transform: translateY(-2px);
+      box-shadow: 0 10px 30px rgba(255, 255, 255, 0.2);
     }
 
-    .features {
-      margin-top: 30px;
-      text-align: left;
-      display: inline-block;
-      width: 100%;
+    .btn:active {
+      transform: translateY(0);
     }
 
-    .feature-item {
-      display: flex;
-      align-items: center;
-      margin: 10px 0;
-      color: rgba(255, 255, 255, 0.7);
-      font-size: 0.9rem;
-    }
-
-    .feature-item svg {
-      margin-right: 12px;
-      color: #4ade80;
-    }
-
-    footer {
-      margin-top: 40px;
-      font-size: 12px;
-      color: rgba(255, 255, 255, 0.3);
-      letter-spacing: 1px;
-    }
-  </style>
-</head>
-<body>
-
-  <div class="container">
-    <h1>JGR Cursor</h1>
-    <p class="subtitle">Custom Windows cursors, simplified.</p>
-
-    <div class="glass">
-      <a href="JGR.Cursor.Installer.exe" download="JGR.Cursor.Installer.exe" class="btn">
-        Download for Windows
-      </a>
-
-      <div class="features">
-        <div class="feature-item">
-          <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"></path></svg>
-          Direct Executable (.exe)
-        </div>
-        <div class="feature-item">
-          <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M5 13l4 4L19 7"></path></svg>
-          No complex setup required
-        </div>
-      </div>
-    </div>
-
-    <a href="https://github.com/infamousjuu-debug/jgr-cursor-installer" target="_blank" class="github-box">
-      <div class="github-info">
-        <svg height="24" width="24" fill="currentColor" viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
-        <span>View Source on GitHub</span>
-      </div>
-      <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"></path></svg>
-    </a>
-
-    <footer>
-      &copy; 2026 JGR SOFTWARE &bull; OPEN SOURCE
-    </footer>
-  </div>
-
-</body>
-</html>
+    /* Shimmer animation on button */
+    .btn::after {
+      content: "";
+      position: absolute;
+      top: -50%; left: -50%;
+      width: 200%; height: 200%;
+      background: linear-gradient(45deg, transparent, rgba(255,255,25
