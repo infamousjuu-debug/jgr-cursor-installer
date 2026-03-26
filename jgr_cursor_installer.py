@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JGR Cursor Installer  v2.2
+JGR Cursor Installer  v2.2.1
 Dark-themed cursor installer for Windows with smart auto-detection.
 Supports: .cur  .ani  .ico  .zip  .rar  .7z  .tar  .gz  .bz2  .xz
 """
@@ -21,7 +21,7 @@ import subprocess
 from pathlib import Path
 
 # ── Version & Auto-Update Config ─────────────────────────────────────────────
-APP_VERSION   = '2.2.0'
+APP_VERSION   = '2.2.1'
 APP_NAME      = 'JGR Cursor Installer'
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -42,16 +42,13 @@ UPDATE_CHECK_URL  = 'https://api.github.com/repos/infamousjuu-debug/jgr-cursor-i
 UPDATE_CHECK_SECS = 3600    # How often to re-check (seconds); default 1 hour
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  AI CURSOR CREATOR CONFIG  —  Uses Google Gemini to generate cursors    ║
-# ╠═══════════════════════════════════════════════════════════════════════════╣
-# ║  Get a free API key at: https://aistudio.google.com/apikey             ║
-# ║  Set the key here, or enter it in the app's Creator dialog.            ║
+# ║  AI CURSOR CREATOR  —  Uses Stable Horde (free, no key needed)          ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
-GEMINI_API_KEY    = ''      # ← Paste your Gemini API key here (or enter in-app)
-GEMINI_MODEL      = 'gemini-2.0-flash-preview-image-generation'
+HORDE_API_URL  = 'https://stablehorde.net/api/v2'
+HORDE_API_KEY  = '0000000000'   # anonymous key – free, no signup needed
 
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QFrame, QGraphicsDropShadowEffect,
     QSizePolicy, QScrollArea, QFileDialog, QDialog, QComboBox,
     QGraphicsOpacityEffect, QLineEdit, QTextEdit, QProgressBar
@@ -1313,6 +1310,133 @@ def extract_cursors_from_archive(archive_path, extract_dir):
 
 
 # =============================================================================
+#  Cursor thumbnail helper
+# =============================================================================
+
+def _parse_cur_image(raw):
+    """Extract the first image from a .cur/.ico file as a PIL Image."""
+    import io
+    if len(raw) < 22:
+        return None
+    reserved, img_type, count = struct.unpack_from('<HHH', raw, 0)
+    if img_type not in (1, 2) or count < 1:
+        return None
+    # ICONDIRENTRY is 16 bytes: BBBB HH II  starting at offset 6
+    # Bytes 6-9: width, height, colorCount, reserved
+    # Bytes 10-11: hotspotX (or planes), 12-13: hotspotY (or bitCount)
+    # Bytes 14-17: bytesInRes (DWORD), 18-21: imageOffset (DWORD)
+    w = raw[6] or 256
+    h = raw[7] or 256
+    data_size = struct.unpack_from('<I', raw, 14)[0]
+    data_off  = struct.unpack_from('<I', raw, 18)[0]
+    if data_off + data_size > len(raw):
+        return None
+    icon_data = raw[data_off:data_off + data_size]
+    # Check if it's a PNG inside
+    if icon_data[:8] == b'\x89PNG\r\n\x1a\n':
+        return Image.open(io.BytesIO(icon_data))
+    # Otherwise it's a BMP DIB
+    if len(icon_data) < 40:
+        return None
+    bi_size = struct.unpack_from('<I', icon_data, 0)[0]
+    if bi_size < 40:
+        return None
+    bw = struct.unpack_from('<i', icon_data, 4)[0]
+    bh = struct.unpack_from('<i', icon_data, 8)[0]
+    bpp = struct.unpack_from('<H', icon_data, 14)[0]
+    real_h = abs(bh) // 2  # height includes XOR + AND
+    if bw <= 0 or real_h <= 0:
+        return None
+    if bpp == 32:
+        xor_start = bi_size
+        xor_size = bw * real_h * 4
+        if xor_start + xor_size > len(icon_data):
+            return None
+        img = Image.new('RGBA', (bw, real_h))
+        pix = img.load()
+        for y in range(real_h):
+            for x in range(bw):
+                off = xor_start + ((real_h - 1 - y) * bw + x) * 4
+                if off + 4 <= len(icon_data):
+                    b, g, r, a = icon_data[off], icon_data[off+1], icon_data[off+2], icon_data[off+3]
+                    pix[x, y] = (r, g, b, a)
+        return img
+    return None
+
+
+def _cursor_to_pixmap(filepath, size=32):
+    """Try to load a cursor file (.cur/.ani/.ico) as a QPixmap for preview.
+    Returns a QPixmap of the given size, or an empty QPixmap on failure."""
+    from PyQt5.QtGui import QImage, QPixmap
+    try:
+        if not os.path.isfile(filepath):
+            return QPixmap()
+        ext = Path(filepath).suffix.lower()
+        img = None
+
+        # Check for PNG sidecar (created by AI generator)
+        png_path = os.path.splitext(filepath)[0] + '.png'
+        if os.path.isfile(png_path):
+            try:
+                img = Image.open(png_path)
+                img.load()
+            except Exception:
+                img = None
+
+        if img is None:
+            try:
+                with open(filepath, 'rb') as fh:
+                    raw = fh.read()
+            except Exception:
+                return QPixmap()
+
+            # Try ANI first-frame extraction
+            if ext == '.ani':
+                try:
+                    img = _extract_first_frame_from_ani(raw)
+                except Exception:
+                    img = None
+
+            # Try parsing as .cur/.ico raw bitmap (works for .cur, .ico,
+            # and misnamed .ani files that are actually .cur)
+            if img is None:
+                try:
+                    img = _parse_cur_image(raw)
+                except Exception:
+                    img = None
+
+            # Fallback: try PIL on raw bytes, then on filepath
+            if img is None:
+                try:
+                    import io
+                    img = Image.open(io.BytesIO(raw))
+                    img.load()
+                except Exception:
+                    try:
+                        img = Image.open(filepath)
+                        img.load()
+                    except Exception:
+                        img = None
+
+        if img is None:
+            return QPixmap()
+
+        img = img.convert('RGBA').resize((size, size),
+            Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS)
+
+        # CRITICAL: QImage does NOT copy the buffer — it just references it.
+        # We must keep 'data' alive and use qimg.copy() to force a deep copy
+        # before 'data' can be garbage collected, otherwise → crash.
+        data = img.tobytes('raw', 'BGRA')
+        qimg = QImage(data, size, size, size * 4, QImage.Format_ARGB32)
+        result = QPixmap.fromImage(qimg.copy())  # .copy() = deep copy, safe
+        return result
+    except Exception:
+        pass
+    return QPixmap()
+
+
+# =============================================================================
 #  Threads
 # =============================================================================
 
@@ -1477,12 +1601,100 @@ class UpdateChecker(QThread):
             pass  # Silently fail — update check should never break the app
 
 
+class UpdateDownloader(QThread):
+    """Downloads the new .exe in the background."""
+    progress = pyqtSignal(int)       # percent 0-100
+    finished = pyqtSignal(str)       # path to downloaded file ('' on failure)
+    error    = pyqtSignal(str)       # error message
+
+    def __init__(self, download_url):
+        super().__init__()
+        self.download_url = download_url
+
+    def run(self):
+        try:
+            import urllib.request, ssl
+            ctx = ssl.create_default_context()
+            req = urllib.request.Request(self.download_url, headers={
+                'User-Agent': f'{APP_NAME}/{APP_VERSION}'})
+
+            tmp_path = os.path.join(tempfile.gettempdir(),
+                                    f'jgr_update_{os.getpid()}.exe')
+
+            with urllib.request.urlopen(req, timeout=120, context=ctx) as resp:
+                total = int(resp.headers.get('Content-Length', 0))
+                downloaded = 0
+                with open(tmp_path, 'wb') as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            self.progress.emit(int(downloaded / total * 100))
+
+            self.finished.emit(tmp_path)
+        except Exception as exc:
+            self.error.emit(str(exc))
+            self.finished.emit('')
+
+
+def _apply_update_and_restart(new_exe_path):
+    """Launch a batch script that waits for us to exit, swaps the exe, and relaunches."""
+    current_exe = sys.executable
+    # If running as a script (not frozen exe), can't self-update
+    if not getattr(sys, 'frozen', False):
+        webbrowser.open(os.path.dirname(new_exe_path))
+        return
+
+    bat_path = os.path.join(tempfile.gettempdir(), f'jgr_update_{os.getpid()}.bat')
+    bat_content = f'''@echo off
+:: Wait for the app to fully close
+timeout /t 2 /nobreak >nul
+
+:: Try to replace the exe (retry a few times in case file is still locked)
+set RETRIES=10
+:retry
+copy /y "{new_exe_path}" "{current_exe}" >nul 2>&1
+if errorlevel 1 (
+    set /a RETRIES-=1
+    if %RETRIES% gtr 0 (
+        timeout /t 1 /nobreak >nul
+        goto retry
+    )
+    echo Update failed - file may be locked.
+    pause
+    goto cleanup
+)
+
+:: Relaunch the updated app
+start "" "{current_exe}"
+
+:cleanup
+:: Clean up temp files
+del /q "{new_exe_path}" >nul 2>&1
+del /q "%~f0" >nul 2>&1
+'''
+    with open(bat_path, 'w') as f:
+        f.write(bat_content)
+
+    # Launch the batch script hidden (no visible cmd window)
+    subprocess.Popen(
+        ['cmd', '/c', bat_path],
+        creationflags=0x08000000,  # CREATE_NO_WINDOW
+        close_fds=True
+    )
+
+
 class UpdateBanner(QWidget):
-    """A sleek notification banner shown when a newer version is available."""
+    """A sleek notification banner that auto-downloads and installs updates."""
 
     def __init__(self, parent, new_version, download_url, changelog=''):
         super().__init__(parent)
         self.download_url = download_url
+        self.new_version  = new_version
+        self._downloaded  = ''
         self.setFixedHeight(0)
         self._target_h = 54
         self.setStyleSheet('background:transparent;')
@@ -1492,27 +1704,37 @@ class UpdateBanner(QWidget):
         lay.setSpacing(10)
 
         # "NEW" badge
-        badge = QLabel('NEW')
-        badge.setFont(QFont('Segoe UI', 7, QFont.Bold))
-        badge.setFixedSize(36, 18)
-        badge.setAlignment(Qt.AlignCenter)
-        badge.setStyleSheet(
+        self._badge = QLabel('NEW')
+        self._badge.setFont(QFont('Segoe UI', 7, QFont.Bold))
+        self._badge.setFixedSize(36, 18)
+        self._badge.setAlignment(Qt.AlignCenter)
+        self._badge.setStyleSheet(
             'color:#000;background:#00e070;border-radius:4px;letter-spacing:1px;')
 
         # Message
-        msg = QLabel(f'Version {new_version} is available!')
-        msg.setFont(QFont('Segoe UI', 9))
-        msg.setStyleSheet('color:rgba(255,255,255,180);background:transparent;')
+        self._msg = QLabel(f'Version {new_version} is available!')
+        self._msg.setFont(QFont('Segoe UI', 9))
+        self._msg.setStyleSheet('color:rgba(255,255,255,180);background:transparent;')
+
+        # Progress bar (hidden until downloading)
+        self._prog = QProgressBar()
+        self._prog.setFixedSize(80, 10)
+        self._prog.setRange(0, 100); self._prog.setValue(0)
+        self._prog.setTextVisible(False)
+        self._prog.setStyleSheet(
+            'QProgressBar{background:rgba(255,255,255,12);border:none;border-radius:4px;}'
+            'QProgressBar::chunk{background:#00e070;border-radius:4px;}')
+        self._prog.hide()
 
         # Update button
-        upd_btn = QPushButton('Update')
-        upd_btn.setFont(QFont('Segoe UI', 8, QFont.Bold))
-        upd_btn.setFixedSize(70, 26)
-        upd_btn.setCursor(Qt.PointingHandCursor if hasattr(Qt, 'PointingHandCursor') else Qt.ArrowCursor)
-        upd_btn.setStyleSheet(
+        self._upd_btn = QPushButton('Update')
+        self._upd_btn.setFont(QFont('Segoe UI', 8, QFont.Bold))
+        self._upd_btn.setFixedSize(70, 26)
+        self._upd_btn.setStyleSheet(
             'QPushButton{color:#000;background:#fff;border:none;border-radius:6px;}'
-            'QPushButton:hover{background:#e0e0e0;}')
-        upd_btn.clicked.connect(self._on_update)
+            'QPushButton:hover{background:#e0e0e0;}'
+            'QPushButton:disabled{color:rgba(80,80,80,120);background:rgba(255,255,255,20);}')
+        self._upd_btn.clicked.connect(self._on_update)
 
         # Dismiss
         dismiss = QPushButton('x')
@@ -1523,10 +1745,11 @@ class UpdateBanner(QWidget):
             'QPushButton:hover{color:rgba(255,255,255,180);}')
         dismiss.clicked.connect(self._dismiss)
 
-        lay.addWidget(badge)
-        lay.addWidget(msg)
+        lay.addWidget(self._badge)
+        lay.addWidget(self._msg)
         lay.addStretch()
-        lay.addWidget(upd_btn)
+        lay.addWidget(self._prog)
+        lay.addWidget(self._upd_btn)
         lay.addWidget(dismiss)
 
         # Slide-in animation
@@ -1547,12 +1770,57 @@ class UpdateBanner(QWidget):
         self._anim.start()
 
     def _on_update(self):
-        if self.download_url:
-            if self.download_url.lower().endswith('.exe'):
-                # Direct .exe download — open in browser for the user to run
-                webbrowser.open(self.download_url)
-            else:
-                webbrowser.open(self.download_url)
+        if not self.download_url:
+            return
+
+        if self._downloaded:
+            # Already downloaded — apply and restart
+            self._msg.setText('Restarting...')
+            self._upd_btn.setEnabled(False)
+            QApplication.processEvents()
+            _apply_update_and_restart(self._downloaded)
+            QApplication.quit()
+            return
+
+        # Start downloading
+        self._upd_btn.setEnabled(False)
+        self._upd_btn.setText('...')
+        self._msg.setText(f'Downloading v{self.new_version}...')
+        self._prog.show()
+        self._prog.setValue(0)
+
+        self._dl_thread = UpdateDownloader(self.download_url)
+        self._dl_thread.progress.connect(self._on_dl_progress)
+        self._dl_thread.error.connect(self._on_dl_error)
+        self._dl_thread.finished.connect(self._on_dl_finished)
+        self._dl_thread.start()
+
+    def _on_dl_progress(self, pct):
+        self._prog.setValue(pct)
+
+    def _on_dl_error(self, err_msg):
+        self._msg.setText('Download failed — click to retry')
+        self._msg.setStyleSheet('color:rgba(255,100,100,200);background:transparent;')
+        self._upd_btn.setEnabled(True)
+        self._upd_btn.setText('Retry')
+        self._prog.hide()
+
+    def _on_dl_finished(self, path):
+        if not path:
+            return  # error handler already ran
+        self._downloaded = path
+        self._prog.setValue(100)
+        self._prog.hide()
+        self._badge.setText('OK')
+        self._badge.setStyleSheet(
+            'color:#000;background:#00e070;border-radius:4px;letter-spacing:1px;')
+        self._msg.setText(f'v{self.new_version} ready — click to install & restart')
+        self._msg.setStyleSheet('color:rgba(80,230,130,220);background:transparent;')
+        self._upd_btn.setEnabled(True)
+        self._upd_btn.setText('Install')
+        self._upd_btn.setStyleSheet(
+            'QPushButton{color:#000;background:#00e070;border:none;border-radius:6px;}'
+            'QPushButton:hover{background:#00cc60;}')
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -1609,16 +1877,13 @@ _GEN_ROLES_EXTRA  = ['UpArrow', 'NWPen', 'Pin', 'Person']
 
 
 def _build_cursor_prompt(theme_desc, role):
-    """Build a Gemini prompt for generating a single cursor image."""
+    """Build an image prompt for generating a single cursor image."""
     shape_desc = _ROLE_PROMPTS.get(role, 'a mouse cursor icon')
     return (
-        f"Generate a single 32x32 pixel cursor icon: {shape_desc}. "
-        f"Style/theme: {theme_desc}. "
-        f"Requirements: transparent background (PNG with alpha), "
-        f"clean pixel art at exactly 32x32 pixels, "
-        f"the icon should be clearly visible and recognizable as a cursor, "
-        f"use sharp edges suitable for a small icon. "
-        f"Output ONLY the image, no text."
+        f"{theme_desc} style {shape_desc}, "
+        f"32x32 pixel cursor icon, transparent background, "
+        f"clean sharp edges, small icon suitable for mouse cursor, "
+        f"no text, centered"
     )
 
 
@@ -1661,60 +1926,115 @@ def _write_cur_file(img, hotspot, out_path):
 
     dib = bih + bytes(xor_data) + bytes(and_data)
 
-    # .cur file structure
-    icon_dir_entry = struct.pack('<BBBBHHIH',
+    # .cur file structure: ICONDIR (6 bytes) + ICONDIRENTRY (16 bytes) + DIB data
+    icon_dir_entry = struct.pack('<BBBBHHII',
         W if W < 256 else 0,
         H if H < 256 else 0,
         0,          # color count
         0,          # reserved
         hx,         # hotspot X
         hy,         # hotspot Y
-        len(dib),   # data size
-        6 + 16)     # data offset (header=6, one entry=16)
+        len(dib),   # data size  (DWORD)
+        6 + 16)     # data offset (DWORD) = header(6) + one entry(16)
 
     header = struct.pack('<HHH', 0, 2, 1)  # reserved, type=CUR, count=1
     with open(out_path, 'wb') as f:
         f.write(header + icon_dir_entry + dib)
 
 
-def _gemini_generate_image(api_key, prompt, model=None):
-    """Call Gemini API to generate an image. Returns PIL Image or raises."""
-    import urllib.request, ssl, base64, io
-    model = model or GEMINI_MODEL
-    url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}'
+def _horde_generate_image(prompt):
+    """Call Stable Horde to generate an image. Returns PIL Image or raises.
+    Free, no API key needed – uses anonymous access."""
+    import urllib.request, ssl, io, time as _time
 
-    payload = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}
-    })
-
-    req = urllib.request.Request(url, data=payload.encode(),
-        headers={'Content-Type': 'application/json'})
     ctx = ssl.create_default_context()
 
-    with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
-        data = json.loads(resp.read().decode())
+    # 1. Submit async generation request
+    payload = json.dumps({
+        'prompt': prompt,
+        'params': {
+            'width': 128, 'height': 128,
+            'steps': 25, 'n': 1,
+            'post_processing': ['GFPGAN'],
+        },
+        'nsfw': False,
+    }).encode()
 
-    # Extract image from response
-    for candidate in data.get('candidates', []):
-        for part in candidate.get('content', {}).get('parts', []):
-            if 'inlineData' in part:
-                b64 = part['inlineData']['data']
-                return Image.open(io.BytesIO(base64.b64decode(b64)))
+    req = urllib.request.Request(
+        f'{HORDE_API_URL}/generate/async',
+        data=payload,
+        headers={
+            'Content-Type': 'application/json',
+            'apikey': HORDE_API_KEY,
+        })
 
-    raise RuntimeError('No image returned from Gemini')
+    try:
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            result = json.loads(resp.read())
+        job_id = result.get('id')
+        if not job_id:
+            raise RuntimeError(f'Stable Horde did not return a job ID: {result}')
+    except urllib.error.HTTPError as e:
+        body = e.read().decode('utf-8', errors='replace')[:200] if hasattr(e, 'read') else ''
+        raise RuntimeError(f'Stable Horde submit error (HTTP {e.code}): {body}')
+
+    # 2. Poll for completion (up to ~3 minutes)
+    for attempt in range(60):
+        _time.sleep(3)
+        try:
+            with urllib.request.urlopen(
+                    f'{HORDE_API_URL}/generate/check/{job_id}',
+                    timeout=15, context=ctx) as r:
+                status = json.loads(r.read())
+            if status.get('done'):
+                break
+            if status.get('faulted'):
+                raise RuntimeError('Generation faulted – try again')
+        except urllib.error.HTTPError:
+            continue
+    else:
+        raise RuntimeError('Generation timed out – the queue may be busy, try again')
+
+    # 3. Get the finished image URL
+    try:
+        with urllib.request.urlopen(
+                f'{HORDE_API_URL}/generate/status/{job_id}',
+                timeout=30, context=ctx) as r:
+            final = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f'Failed to fetch result: HTTP {e.code}')
+
+    gens = final.get('generations', [])
+    if not gens:
+        raise RuntimeError('No image was generated – try a different prompt')
+
+    img_url = gens[0].get('img', '')
+    if not img_url:
+        raise RuntimeError('Generation completed but no image URL returned')
+
+    # 4. Download the image
+    req2 = urllib.request.Request(img_url, headers={
+        'User-Agent': 'JGR-Cursor-Installer/2.2',
+    })
+    try:
+        with urllib.request.urlopen(req2, timeout=60, context=ctx) as r2:
+            img_data = r2.read()
+        if len(img_data) < 100:
+            raise RuntimeError('Downloaded image is too small / empty')
+        return Image.open(io.BytesIO(img_data))
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f'Failed to download generated image: HTTP {e.code}')
 
 
 class CursorGeneratorThread(QThread):
-    """Background thread that generates all cursor images via Gemini."""
+    """Background thread that generates all cursor images via Stable Horde."""
     progress    = pyqtSignal(str, int, int)   # role, current, total
     role_done   = pyqtSignal(str, str)        # role, filepath
     error       = pyqtSignal(str, str)        # role, error message
     all_done    = pyqtSignal(str, int, int)   # output_dir, success_count, total
 
-    def __init__(self, api_key, theme_desc, output_dir, include_extra=False):
+    def __init__(self, theme_desc, output_dir, include_extra=False):
         super().__init__()
-        self.api_key     = api_key
         self.theme_desc  = theme_desc
         self.output_dir  = output_dir
         self.roles       = list(_GEN_ROLES_MAIN)
@@ -1730,7 +2050,7 @@ class CursorGeneratorThread(QThread):
             self.progress.emit(role, i + 1, total)
             prompt = _build_cursor_prompt(self.theme_desc, role)
             try:
-                img = _gemini_generate_image(self.api_key, prompt)
+                img = _horde_generate_image(prompt)
                 img = img.convert('RGBA').resize((32, 32),
                     Image.LANCZOS if hasattr(Image, 'LANCZOS') else Image.ANTIALIAS)
 
@@ -1738,6 +2058,11 @@ class CursorGeneratorThread(QThread):
                 fpath = os.path.join(self.output_dir, fname)
                 hotspot = _ROLE_HOTSPOTS.get(role, (0, 0))
                 _write_cur_file(img, hotspot, fpath)
+                # Save PNG sidecar for preview thumbnails
+                try:
+                    img.save(os.path.join(self.output_dir, f'{role}.png'), 'PNG')
+                except Exception:
+                    pass
 
                 ok += 1
                 self.role_done.emit(role, fpath)
@@ -1755,7 +2080,7 @@ class CursorCreatorDialog(QDialog):
         super().__init__(parent)
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(480, 520)
+        self.setFixedSize(500, 520)
         self._drag_origin = None
         self._generated   = []
         self._build_ui()
@@ -1791,115 +2116,61 @@ class CursorCreatorDialog(QDialog):
         title_row.addWidget(title); title_row.addStretch(); title_row.addWidget(close_btn)
         lay.addLayout(title_row)
 
-        sub = QLabel('Describe a theme and Gemini will generate all cursor images')
-        sub.setFont(QFont('Segoe UI', 8))
-        sub.setStyleSheet('color:rgba(255,255,255,50);background:transparent;')
-        sub.setWordWrap(True)
-        lay.addWidget(sub)
+        lay.addStretch()
 
-        # API key input
-        key_lbl = QLabel('GEMINI API KEY')
-        key_lbl.setFont(QFont('Segoe UI', 7, QFont.Bold))
-        key_lbl.setStyleSheet('color:rgba(255,255,255,40);background:transparent;letter-spacing:2px;')
-        lay.addWidget(key_lbl)
+        # ── Under Development overlay ──
+        dev_icon = QLabel()
+        dev_icon.setAlignment(Qt.AlignCenter)
+        dev_icon.setFont(QFont('Segoe UI', 36))
+        dev_icon.setText('\u2692')   # hammer-and-pick unicode
+        dev_icon.setStyleSheet('color:rgba(100,160,255,120);background:transparent;')
+        lay.addWidget(dev_icon)
 
-        self._key_input = QLineEdit()
-        self._key_input.setPlaceholderText('Paste your Gemini API key (from aistudio.google.com/apikey)')
-        self._key_input.setEchoMode(QLineEdit.Password)
-        if GEMINI_API_KEY:
-            self._key_input.setText(GEMINI_API_KEY)
-        self._key_input.setFont(QFont('Segoe UI', 9))
-        self._key_input.setFixedHeight(34)
-        self._key_input.setStyleSheet(
-            'QLineEdit{color:#fff;background:rgba(255,255,255,6);'
-            'border:1px solid rgba(255,255,255,20);border-radius:8px;padding:0 10px;}'
-            'QLineEdit:focus{border-color:rgba(255,255,255,50);}')
-        lay.addWidget(self._key_input)
+        dev_title = QLabel('UNDER DEVELOPMENT')
+        dev_title.setFont(QFont('Segoe UI', 16, QFont.Bold))
+        dev_title.setAlignment(Qt.AlignCenter)
+        dev_title.setStyleSheet('color:rgba(255,255,255,180);background:transparent;letter-spacing:4px;')
+        lay.addWidget(dev_title)
 
-        # Theme input
-        theme_lbl = QLabel('THEME DESCRIPTION')
-        theme_lbl.setFont(QFont('Segoe UI', 7, QFont.Bold))
-        theme_lbl.setStyleSheet('color:rgba(255,255,255,40);background:transparent;letter-spacing:2px;')
-        lay.addWidget(theme_lbl)
+        dev_sub = QLabel(
+            'AI Cursor Creator is being rebuilt with a new engine.\n'
+            'This feature will be available in a future update.')
+        dev_sub.setFont(QFont('Segoe UI', 9))
+        dev_sub.setAlignment(Qt.AlignCenter)
+        dev_sub.setWordWrap(True)
+        dev_sub.setStyleSheet('color:rgba(255,255,255,60);background:transparent;')
+        lay.addWidget(dev_sub)
 
-        self._theme_input = QTextEdit()
-        self._theme_input.setPlaceholderText(
-            'Describe your cursor style...\n\n'
-            'Examples:\n'
-            '  Neon blue cyberpunk with glowing edges\n'
-            '  Minimalist white outline on transparent\n'
-            '  Pixel art medieval fantasy RPG\n'
-            '  Cute pastel pink kawaii style')
-        self._theme_input.setFont(QFont('Segoe UI', 9))
-        self._theme_input.setFixedHeight(100)
-        self._theme_input.setStyleSheet(
-            'QTextEdit{color:#fff;background:rgba(255,255,255,6);'
-            'border:1px solid rgba(255,255,255,20);border-radius:8px;padding:8px;}'
-            'QTextEdit:focus{border-color:rgba(255,255,255,50);}')
-        lay.addWidget(self._theme_input)
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet('color:rgba(255,255,255,10);')
+        sep.setFixedWidth(200)
+        sep_row = QHBoxLayout(); sep_row.addStretch(); sep_row.addWidget(sep); sep_row.addStretch()
+        lay.addLayout(sep_row)
 
-        # Progress area
-        self._progress_bar = QProgressBar()
-        self._progress_bar.setFixedHeight(6)
-        self._progress_bar.setRange(0, 100)
-        self._progress_bar.setValue(0)
-        self._progress_bar.setTextVisible(False)
-        self._progress_bar.setStyleSheet(
-            'QProgressBar{background:rgba(255,255,255,8);border:none;border-radius:3px;}'
-            'QProgressBar::chunk{background:#fff;border-radius:3px;}')
-        self._progress_bar.hide()
-        lay.addWidget(self._progress_bar)
+        dev_hint = QLabel('In the meantime, use Browse Cursors to find\nthousands of free cursor packs to install.')
+        dev_hint.setFont(QFont('Segoe UI', 8))
+        dev_hint.setAlignment(Qt.AlignCenter)
+        dev_hint.setStyleSheet('color:rgba(140,180,255,100);background:transparent;')
+        lay.addWidget(dev_hint)
 
-        self._progress_lbl = QLabel('')
-        self._progress_lbl.setFont(QFont('Segoe UI', 8))
-        self._progress_lbl.setStyleSheet('color:rgba(255,255,255,60);background:transparent;')
-        self._progress_lbl.setAlignment(Qt.AlignCenter)
-        lay.addWidget(self._progress_lbl)
+        lay.addStretch()
 
-        # Log area (shows each role as it completes)
-        self._log = QTextEdit()
-        self._log.setReadOnly(True)
-        self._log.setFont(QFont('Consolas', 8))
-        self._log.setFixedHeight(80)
-        self._log.setStyleSheet(
-            'QTextEdit{color:rgba(255,255,255,50);background:rgba(255,255,255,3);'
-            'border:1px solid rgba(255,255,255,10);border-radius:8px;padding:6px;}')
-        self._log.hide()
-        lay.addWidget(self._log)
-
-        # Generate button
-        self._gen_btn = QPushButton('GENERATE CURSOR PACK')
-        self._gen_btn.setFont(QFont('Segoe UI', 10, QFont.Bold))
-        self._gen_btn.setFixedHeight(42)
-        self._gen_btn.setStyleSheet(
-            'QPushButton{color:#000;background:#fff;border:none;border-radius:10px;letter-spacing:2px;}'
-            'QPushButton:hover{background:#e0e0e0;}'
-            'QPushButton:disabled{color:rgba(120,120,120,80);background:rgba(255,255,255,8);}')
-        self._gen_btn.clicked.connect(self._start_generation)
-        lay.addWidget(self._gen_btn)
-
-        # Install button (appears after generation)
-        self._install_btn = QPushButton('INSTALL GENERATED CURSORS')
-        self._install_btn.setFont(QFont('Segoe UI', 9, QFont.Bold))
-        self._install_btn.setFixedHeight(36)
-        self._install_btn.setStyleSheet(
-            'QPushButton{color:#000;background:qlineargradient(x1:0,y1:0,x2:1,y2:0,'
-            'stop:0 #00e888,stop:1 #00cc66);border:none;border-radius:9px;letter-spacing:1px;}'
-            'QPushButton:hover{background:#00cc66;}')
-        self._install_btn.clicked.connect(self._install_generated)
-        self._install_btn.hide()
-        lay.addWidget(self._install_btn)
+        # Keep these hidden but existing so the rest of the code doesn't crash
+        self._theme_input = QTextEdit(); self._theme_input.hide()
+        self._progress_bar = QProgressBar(); self._progress_bar.hide()
+        self._progress_lbl = QLabel(''); self._progress_lbl.hide()
+        self._preview_frame = QWidget()
+        self._preview_grid = QGridLayout(self._preview_frame)
+        self._preview_frame.hide()
+        self._preview_col = 0; self._preview_row = 0
+        self._gen_btn = QPushButton(); self._gen_btn.hide()
+        self._install_btn = QPushButton(); self._install_btn.hide()
 
         root.addWidget(panel)
 
     def _start_generation(self):
-        api_key = self._key_input.text().strip()
-        theme   = self._theme_input.toPlainText().strip()
+        theme = self._theme_input.toPlainText().strip()
 
-        if not api_key:
-            self._progress_lbl.setText('Please enter your Gemini API key')
-            self._progress_lbl.setStyleSheet('color:rgba(255,100,100,200);background:transparent;')
-            return
         if not theme:
             self._progress_lbl.setText('Please describe a cursor theme')
             self._progress_lbl.setStyleSheet('color:rgba(255,100,100,200);background:transparent;')
@@ -1910,14 +2181,20 @@ class CursorCreatorDialog(QDialog):
         self._install_btn.hide()
         self._progress_bar.show()
         self._progress_bar.setValue(0)
-        self._log.show()
-        self._log.clear()
+        self._preview_frame.show()
+        # Clear old previews
+        while self._preview_grid.count():
+            w = self._preview_grid.takeAt(0).widget()
+            if w: w.deleteLater()
+        self._preview_col = 0
+        self._preview_row = 0
         self._generated = []
 
         out_dir = os.path.join(tempfile.gettempdir(), 'jgr_ai_cursors',
                                re.sub(r'[^\w\s-]', '', theme)[:30].strip())
 
-        self._gen_thread = CursorGeneratorThread(api_key, theme, out_dir, include_extra=True)
+        self._gen_thread = CursorGeneratorThread(
+            theme, out_dir, include_extra=True)
         self._gen_thread.progress.connect(self._on_progress)
         self._gen_thread.role_done.connect(self._on_role_done)
         self._gen_thread.error.connect(self._on_role_error)
@@ -1932,30 +2209,151 @@ class CursorCreatorDialog(QDialog):
 
     def _on_role_done(self, role, filepath):
         self._generated.append(filepath)
-        self._log.append(f'  + {role}.cur')
+        # Add preview icon to the grid
+        try:
+            cell = QWidget()
+            cell_lay = QVBoxLayout(cell)
+            cell_lay.setContentsMargins(2, 2, 2, 2)
+            cell_lay.setSpacing(1)
+            thumb = QLabel()
+            thumb.setFixedSize(28, 28)
+            thumb.setAlignment(Qt.AlignCenter)
+            thumb.setStyleSheet('background:transparent;border:none;')
+            try:
+                pix = _cursor_to_pixmap(filepath, 28)
+                if not pix.isNull():
+                    thumb.setPixmap(pix)
+                else:
+                    thumb.setText('+')
+                    thumb.setStyleSheet('color:rgba(80,230,130,120);background:transparent;')
+            except Exception:
+                thumb.setText('+')
+                thumb.setStyleSheet('color:rgba(80,230,130,120);background:transparent;')
+            lbl = QLabel(role)
+            lbl.setFont(QFont('Segoe UI', 6))
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet('color:rgba(255,255,255,50);background:transparent;')
+            cell_lay.addWidget(thumb, 0, Qt.AlignCenter)
+            cell_lay.addWidget(lbl, 0, Qt.AlignCenter)
+            self._preview_grid.addWidget(cell, self._preview_row, self._preview_col)
+            self._preview_col += 1
+            if self._preview_col >= 9:
+                self._preview_col = 0
+                self._preview_row += 1
+        except Exception:
+            pass
 
     def _on_role_error(self, role, error_msg):
-        short = error_msg[:80] if len(error_msg) > 80 else error_msg
-        self._log.append(f'  x {role} — {short}')
+        # Show an X for failed roles
+        cell = QWidget()
+        cell_lay = QVBoxLayout(cell)
+        cell_lay.setContentsMargins(2, 2, 2, 2)
+        cell_lay.setSpacing(1)
+        x_lbl = QLabel('X')
+        x_lbl.setFixedSize(28, 28)
+        x_lbl.setAlignment(Qt.AlignCenter)
+        x_lbl.setFont(QFont('Segoe UI', 10, QFont.Bold))
+        x_lbl.setStyleSheet('color:rgba(255,80,80,150);background:transparent;')
+        x_lbl.setToolTip(f'{role}: {error_msg}')
+        lbl = QLabel(role)
+        lbl.setFont(QFont('Segoe UI', 6))
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setStyleSheet('color:rgba(255,80,80,80);background:transparent;')
+        cell_lay.addWidget(x_lbl, 0, Qt.AlignCenter)
+        cell_lay.addWidget(lbl, 0, Qt.AlignCenter)
+        self._preview_grid.addWidget(cell, self._preview_row, self._preview_col)
+        self._preview_col += 1
+        if self._preview_col >= 9:
+            self._preview_col = 0
+            self._preview_row += 1
 
     def _on_all_done(self, output_dir, ok_count, total):
         self._gen_btn.setEnabled(True)
         self._gen_btn.setText('GENERATE CURSOR PACK')
         self._progress_bar.setValue(100)
+        self._output_dir = output_dir
 
         if ok_count == 0:
             self._progress_lbl.setText('Generation failed — check your API key and try again')
             self._progress_lbl.setStyleSheet('color:rgba(255,100,100,200);background:transparent;')
         else:
+            # Auto-save to user's Documents/JGR Cursors folder
+            save_dir = self._save_to_documents(output_dir)
+            save_note = f'  (saved to {save_dir})' if save_dir else ''
             self._progress_lbl.setText(
-                f'Generated {ok_count}/{total} cursors in {output_dir}')
+                f'Generated {ok_count}/{total} cursors!{save_note}')
             self._progress_lbl.setStyleSheet('color:rgba(80,230,130,200);background:transparent;')
             self._install_btn.show()
+            self._install_btn.setText('INSTALL NOW')
+
+    def _save_to_documents(self, src_dir):
+        """Copy generated cursors to Documents/JGR Cursors/<theme> for the user."""
+        try:
+            docs = Path(os.path.expanduser('~/Documents'))
+            if not docs.exists():
+                docs = Path(os.path.expanduser('~'))
+            theme_name = Path(src_dir).name or 'AI Cursors'
+            save_dir = docs / 'JGR Cursors' / theme_name
+            save_dir.mkdir(parents=True, exist_ok=True)
+            for fp in self._generated:
+                dest = save_dir / Path(fp).name
+                shutil.copy2(fp, dest)
+            return str(save_dir)
+        except Exception:
+            return ''
 
     def _install_generated(self):
-        if self._generated:
-            self.cursors_created.emit(list(self._generated))
-            self.close()
+        """Directly install cursors to Windows (registry + SystemParametersInfo)."""
+        if not self._generated:
+            return
+        self._install_btn.setEnabled(False)
+        self._install_btn.setText('Installing...')
+        self._progress_lbl.setText('Applying cursors to Windows...')
+        self._progress_lbl.setStyleSheet('color:rgba(255,255,255,120);background:transparent;')
+        QApplication.processEvents()
+
+        try:
+            import winreg
+            INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+            installed = {}
+            for fp in self._generated:
+                role = Path(fp).stem  # e.g. 'Arrow', 'Hand', etc.
+                # Verify this is a valid cursor role
+                valid_roles = {k for k, _ in CURSOR_ROLES}
+                if role not in valid_roles:
+                    continue
+                dest = INSTALL_DIR / Path(fp).name
+                shutil.copy2(fp, dest)
+                installed[role] = str(dest)
+
+            if installed:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0,
+                                    winreg.KEY_SET_VALUE) as reg:
+                    winreg.SetValueEx(reg, '', 0, winreg.REG_SZ, 'JGR AI')
+                    for key, dest in installed.items():
+                        winreg.SetValueEx(reg, key, 0, winreg.REG_EXPAND_SZ, dest)
+                ctypes.windll.user32.SystemParametersInfoW(
+                    SPI_SETCURSORS, 0, None, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE)
+
+                self._install_btn.setText('INSTALLED!')
+                self._install_btn.setStyleSheet(
+                    'QPushButton{color:#000;background:#00e888;border:none;'
+                    'border-radius:9px;letter-spacing:1px;}')
+                self._progress_lbl.setText(
+                    f'Installed {len(installed)} cursors! Your new cursors are now active.')
+                self._progress_lbl.setStyleSheet('color:rgba(80,230,130,200);background:transparent;')
+                # Also send to main window so file list updates
+                self.cursors_created.emit(list(self._generated))
+            else:
+                self._install_btn.setEnabled(True)
+                self._install_btn.setText('INSTALL NOW')
+                self._progress_lbl.setText('No valid cursor roles found in generated files')
+                self._progress_lbl.setStyleSheet('color:rgba(255,100,100,200);background:transparent;')
+        except Exception as exc:
+            self._install_btn.setEnabled(True)
+            self._install_btn.setText('INSTALL NOW')
+            self._progress_lbl.setText(f'Install error: {exc}')
+            self._progress_lbl.setStyleSheet('color:rgba(255,100,100,200);background:transparent;')
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
@@ -2042,6 +2440,1327 @@ class SitesDialog(QDialog):
 
 
 # =============================================================================
+#  Cursor Browse Gallery  –  scrape thumbnails from cursor sites
+# =============================================================================
+_GALLERY_SOURCES = [
+    {
+        'name': 'RW-Designer.com',
+        'base': 'https://www.rw-designer.com',
+        'per_page': 40,
+        'download_pattern': 'https://www.rw-designer.com/cursor-downloadset/{slug}.zip',
+        'categories': [
+            ('All Cursor Sets',  '/cursor-library'),
+            ('Single Cursors',   '/icon-library/cursors'),
+            ('Animated Cursors', '/icon-library/animated-cursors'),
+        ],
+    },
+    {
+        'name': 'Cursors-4u.com',
+        'base': 'https://www.cursors-4u.com',
+        'per_page': 37,
+        'download_pattern': None,
+        'categories': [
+            ('All',        '/cursor'),
+            ('Sets',       '/sets'),
+            ('Animated',   '/animated'),
+            ('Anime',      '/anime'),
+            ('Games',      '/games'),
+            ('Cute',       '/cute'),
+            ('Comics',     '/comic'),
+            ('Pointers',   '/cursors'),
+            ('Movies/TV',  '/movie_tv'),
+            ('Nature',     '/nature'),
+            ('Food',       '/food'),
+            ('Sports',     '/sports'),
+            ('Celebrity',  '/celebrity'),
+            ('Holidays',   '/holidays'),
+            ('Tech',       '/mechanics'),
+            ('Smiley',     '/smiley'),
+            ('Symbols',    '/symbols'),
+        ],
+    },
+    {
+        'name': 'VSThemes.org',
+        'base': 'https://vsthemes.org',
+        'per_page': 24,
+        'download_pattern': None,
+        'categories': [
+            ('All',       '/en/cursors/'),
+            ('Animated',  '/en/cursors/animated/'),
+            ('Anime',     '/en/cursors/anime/'),
+            ('Black',     '/en/cursors/black/'),
+            ('Neon',      '/en/cursors/neon/'),
+            ('Cartoons',  '/en/cursors/cartoons/'),
+            ('Games',     '/en/cursors/games/'),
+            ('White',     '/en/cursors/white/'),
+            ('Colored',   '/en/cursors/colored/'),
+            ('Static',    '/en/cursors/static/'),
+            ('Mac OS',    '/en/cursors/mac_os/'),
+            ('Linux',     '/en/cursors/linux/'),
+        ],
+    },
+]
+
+
+class _GalleryScraperThread(QThread):
+    """Background thread that scrapes cursor thumbnails from websites."""
+    items_ready  = pyqtSignal(str, list)   # (source_name, [{'title','thumb_url','link','download_url'}])
+    page_info    = pyqtSignal(int)          # total_pages discovered
+    error        = pyqtSignal(str, str)     # (source_name, error_msg)
+
+    def __init__(self, source, page=0, category_path=''):
+        super().__init__()
+        self.source        = source
+        self.page          = page
+        self.category_path = category_path
+
+    # Class-level caches keyed by category_path
+    _max_offset_cache = {}   # RW-Designer: {cat_path: max_offset}
+    _max_page_cache   = {}   # Cursors-4u / VSThemes: {cat_path: max_page}
+
+    def run(self):
+        import urllib.request, ssl, html as html_mod
+        name = self.source['name']
+        cat  = self.category_path
+        _UA  = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        try:
+            ctx = ssl.create_default_context()
+            base = self.source['base']
+
+            if 'RW-Designer' in name:
+                per = self.source['per_page']  # 40
+                if self.page == 0:
+                    url = base + cat  # main page (newest ~20)
+                else:
+                    # Discover max offset for this category once
+                    cache_key = cat
+                    if cache_key not in _GalleryScraperThread._max_offset_cache:
+                        req0 = urllib.request.Request(
+                            base + cat, headers={'User-Agent': _UA})
+                        with urllib.request.urlopen(req0, timeout=25, context=ctx) as r0:
+                            mhtml = r0.read().decode('utf-8', errors='replace')
+                        page_slug = cat.rstrip('/')
+                        offs = [int(m) for m in re.findall(
+                            r'href="' + re.escape(page_slug) + r'/set-(\d+)"', mhtml)]
+                        _GalleryScraperThread._max_offset_cache[cache_key] = max(offs) if offs else 0
+                    max_off = _GalleryScraperThread._max_offset_cache[cache_key]
+                    # KEY FIX: page 1 → set-{max_off - 40}, page 2 → set-{max_off - 80}, etc.
+                    # set-{max_off} is a partial page (often just 1-2 items), so we skip it
+                    off = max_off - self.page * per
+                    if off < 0:
+                        self.items_ready.emit(name, [])
+                        return
+                    url = f'{base}{cat}/set-{off}'
+                    total = (max_off // per) + 1  # page 0 = main, pages 1..N = offsets
+                    self.page_info.emit(total)
+            elif 'Cursors-4u' in name:
+                # Cursors-4u: /cursor, /animated/p2, /sets/p3, etc.
+                if self.page == 0:
+                    url = base + cat
+                else:
+                    url = f'{base}{cat}/p{self.page + 1}'
+            else:
+                # VSThemes: /en/cursors/, /en/cursors/page/2/, etc.
+                if self.page == 0:
+                    url = base + cat
+                else:
+                    cat_clean = cat.rstrip('/')
+                    url = f'{base}{cat_clean}/page/{self.page + 1}/'
+
+            req = urllib.request.Request(url, headers={
+                'User-Agent': _UA,
+                'Accept': 'text/html,application/xhtml+xml',
+                'Accept-Language': 'en-US,en;q=0.9',
+            })
+            # VSThemes rate-limits aggressively — retry once on 429
+            import time as _time
+            raw_html = None
+            for _attempt in range(3):
+                try:
+                    with urllib.request.urlopen(req, timeout=25, context=ctx) as resp:
+                        raw_html = resp.read().decode('utf-8', errors='replace')
+                    break
+                except urllib.request.HTTPError as he:
+                    if he.code == 429 and _attempt < 2:
+                        _time.sleep(4 * (_attempt + 1))  # 4s, 8s
+                        continue
+                    raise
+            if raw_html is None:
+                self.error.emit(name, 'Could not load page (rate limited)')
+                return
+
+            # Discover max page from pagination links
+            if 'Cursors-4u' in name:
+                cache_key = cat
+                pnums = [int(m) for m in re.findall(r'href="[^"]*?/p(\d+)"', raw_html)]
+                if pnums:
+                    discovered = max(pnums)
+                    prev = _GalleryScraperThread._max_page_cache.get(cache_key, 1)
+                    _GalleryScraperThread._max_page_cache[cache_key] = max(prev, discovered)
+                    self.page_info.emit(_GalleryScraperThread._max_page_cache[cache_key])
+                elif cache_key not in _GalleryScraperThread._max_page_cache:
+                    _GalleryScraperThread._max_page_cache[cache_key] = 50
+            elif 'VSThemes' in name:
+                cache_key = cat
+                # VSThemes uses /page/N/ pattern in pagination links
+                pnums = [int(m) for m in re.findall(r'/page/(\d+)/?', raw_html)]
+                if pnums:
+                    discovered = max(pnums)
+                    prev = _GalleryScraperThread._max_page_cache.get(cache_key, 1)
+                    _GalleryScraperThread._max_page_cache[cache_key] = max(prev, discovered)
+                    self.page_info.emit(_GalleryScraperThread._max_page_cache[cache_key])
+                elif cache_key not in _GalleryScraperThread._max_page_cache:
+                    _GalleryScraperThread._max_page_cache[cache_key] = 40
+
+            items = []
+            if 'RW-Designer' in name:
+                items = self._parse_rw_designer(raw_html, self.source)
+            elif 'Cursors-4u' in name:
+                items = self._parse_cursors4u(raw_html, self.source)
+            else:
+                items = self._parse_vsthemes(raw_html, self.source)
+
+            self.items_ready.emit(name, items)
+        except Exception as exc:
+            self.error.emit(name, str(exc))
+
+    @staticmethod
+    def _parse_rw_designer(raw_html, source):
+        """Parse RW-Designer cursor library page.
+
+        HTML structure per entry:
+          <a class="item" href="/cursor-set/{slug}">
+            <img src="/cursor-teaser/{slug}.png" alt="...">
+            <span class="setname">{Title} Cursors</span>
+          </a>
+        """
+        import html as html_mod
+        base = source['base']
+        items = []
+        pattern = re.compile(
+            r'<a\s+class="item"\s+href="(/cursor-set/([^"]+))"[^>]*>\s*'
+            r'<img\s+src="(/cursor-teaser/[^"]+)"[^>]*>\s*'
+            r'<span\s+class="setname">([^<]+)</span>',
+            re.IGNORECASE | re.DOTALL)
+        for m in pattern.finditer(raw_html):
+            slug = m.group(2)
+            link = base + m.group(1)
+            thumb = base + m.group(3)
+            title = html_mod.unescape(m.group(4)).strip()
+            title = re.sub(r'\s*Cursors\s*$', '', title).strip()
+            dl = source['download_pattern'].format(slug=slug)
+            if title:
+                items.append({
+                    'title': title, 'thumb_url': thumb,
+                    'link': link, 'download_url': dl,
+                })
+        return items
+
+    @staticmethod
+    def _parse_cursors4u(raw_html, source):
+        """Parse Cursors-4u.com cursor listing page."""
+        import html as html_mod
+        items = []
+        card_iter = re.finditer(
+            r'<article\s+class="cursor-card[^"]*">(.*?)</article>',
+            raw_html, re.DOTALL | re.IGNORECASE)
+        for card_m in card_iter:
+            card_html = card_m.group(1)
+            # Link can be /cursor/slug, /animated/slug, /games/slug, etc.
+            link_m = re.search(
+                r'<a\s+href="(https?://www\.cursors-4u\.com/[^"]+)"'
+                r'[^>]*\s+title="([^"]*)"', card_html, re.IGNORECASE)
+            if not link_m:
+                # Try reversed order: title before href
+                link_m = re.search(
+                    r'<a\s+[^>]*title="([^"]*)"[^>]*href="(https?://www\.cursors-4u\.com/[^"]+)"',
+                    card_html, re.IGNORECASE)
+                if link_m:
+                    link = link_m.group(2)
+                    title = html_mod.unescape(link_m.group(1)).strip()
+                else:
+                    continue
+            else:
+                link  = link_m.group(1)
+                title = html_mod.unescape(link_m.group(2)).strip()
+            title = re.sub(r'\s*(Cursor|Set)\s*$', '', title).strip()
+            img_m = re.search(r'<img\s+[^>]*src="([^"]+)"', card_html, re.IGNORECASE)
+            thumb = img_m.group(1) if img_m else ''
+            if title and thumb:
+                items.append({
+                    'title': title, 'thumb_url': thumb,
+                    'link': link, 'download_url': None,
+                })
+        return items
+
+    @staticmethod
+    def _parse_vsthemes(raw_html, source):
+        """Parse VSThemes.org cursor listing page.
+
+        Actual card structure (full URL, not relative):
+          <a href="https://vsthemes.org/en/cursors/{cat}/{id}-{slug}.html"
+             class="shorty-img truncate r5x relative flex picture wmax"
+             title="Cursors «Title» on Windows">
+            <img src="https://play.vsthemes.org/nova/640480/..." alt="..." loading="lazy">
+            <figcaption>Title</figcaption>
+          </a>
+        """
+        import html as html_mod
+        base = source['base']
+        items = []
+        # Match <a> tags with class "shorty-img" — href can be full or relative
+        card_pattern = re.compile(
+            r'<a\s+href="((?:https?://vsthemes\.org)?/en/cursors/[^"]+\.html)"'
+            r'[^>]*class="shorty-img[^"]*"[^>]*>(.*?)</a>',
+            re.DOTALL | re.IGNORECASE)
+        for m in card_pattern.finditer(raw_html):
+            href = m.group(1)
+            link = href if href.startswith('http') else base + href
+            card_html = m.group(2)
+            # Title from <figcaption>
+            fig_m = re.search(r'<figcaption[^>]*>(.*?)</figcaption>', card_html, re.DOTALL | re.I)
+            title = ''
+            if fig_m:
+                title = re.sub(r'<[^>]+>', '', fig_m.group(1)).strip()
+                title = html_mod.unescape(title)
+            # Thumbnail from <img src>
+            img_m = re.search(r'<img\s+[^>]*src="([^"]+)"', card_html, re.I)
+            thumb = ''
+            if img_m:
+                thumb = img_m.group(1)
+                if thumb.startswith('/'):
+                    thumb = base + thumb
+            if title and thumb:
+                items.append({
+                    'title': title, 'thumb_url': thumb,
+                    'link': link, 'download_url': None,
+                })
+        return items
+
+
+class _ImageLoaderThread(QThread):
+    """Downloads a single thumbnail image in the background."""
+    image_ready = pyqtSignal(str, bytes)  # (thumb_url, image_data)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        import urllib.request, ssl
+        try:
+            ctx = ssl.create_default_context()
+            req = urllib.request.Request(self.url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                              'AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+                'Referer': self.url.split('/')[0] + '//' + self.url.split('/')[2] + '/',
+            })
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                data = resp.read()
+                if len(data) > 50:
+                    self.image_ready.emit(self.url, data)
+        except Exception:
+            pass
+
+
+class _CursorDownloadThread(QThread):
+    """Downloads a cursor ZIP from RW-Designer and saves to temp dir."""
+    finished_ok  = pyqtSignal(str)   # path to downloaded zip
+    finished_err = pyqtSignal(str)   # error message
+
+    def __init__(self, url, title):
+        super().__init__()
+        self.url   = url
+        self.title = title
+
+    def run(self):
+        import urllib.request, ssl
+        try:
+            ctx = ssl.create_default_context()
+            req = urllib.request.Request(self.url, headers={
+                'User-Agent': 'JGR-Cursor-Installer/2.2',
+            })
+            with urllib.request.urlopen(req, timeout=60, context=ctx) as resp:
+                data = resp.read()
+            if len(data) < 100:
+                self.finished_err.emit('Downloaded file too small — may not be a valid archive')
+                return
+            safe = re.sub(r'[^\w\s-]', '', self.title)[:40].strip() or 'cursors'
+            tmp = os.path.join(tempfile.gettempdir(), 'jgr_browse_dl')
+            os.makedirs(tmp, exist_ok=True)
+            path = os.path.join(tmp, safe + '.zip')
+            with open(path, 'wb') as fh:
+                fh.write(data)
+            self.finished_ok.emit(path)
+        except Exception as exc:
+            self.finished_err.emit(str(exc))
+
+
+class _CursorDetailThread(QThread):
+    """Scrape a cursor-set page to get individual cursor details."""
+    detail_ready = pyqtSignal(dict)  # {'title','author','desc','cursors':[{'name','preview_url','dl_url'}],'zip_url'}
+    error        = pyqtSignal(str)
+
+    def __init__(self, set_url, source_name):
+        super().__init__()
+        self.set_url     = set_url
+        self.source_name = source_name
+
+    def run(self):
+        import urllib.request, ssl, html as html_mod
+        try:
+            ctx = ssl.create_default_context()
+            req = urllib.request.Request(self.set_url, headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                              'AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
+            })
+            with urllib.request.urlopen(req, timeout=25, context=ctx) as resp:
+                raw = resp.read().decode('utf-8', errors='replace')
+
+            result = {'title': '', 'author': '', 'desc': '', 'cursors': [], 'zip_url': ''}
+
+            if 'RW-Designer' in self.source_name or 'rw-designer' in self.set_url:
+                base = 'https://www.rw-designer.com'
+                # Title
+                tm = re.search(r'<h1[^>]*>([^<]+)</h1>', raw)
+                result['title'] = html_mod.unescape(tm.group(1)).strip() if tm else 'Cursor Set'
+                # Author
+                am = re.search(r'rel="author"[^>]*>.*?<span>([^<]+)</span>', raw, re.DOTALL)
+                result['author'] = html_mod.unescape(am.group(1)).strip() if am else ''
+                # ZIP download
+                zm = re.search(r'href="(/cursor-downloadset/[^"]+\.zip)"', raw)
+                result['zip_url'] = base + zm.group(1) if zm else ''
+                # Individual cursors: /cursor-download/ID/NAME  with preview at /cursor-view/ID.png
+                dl_pattern = re.compile(
+                    r'href="(/cursor-download/(\d+)/([^"]+))"', re.I)
+                for m in dl_pattern.finditer(raw):
+                    cid   = m.group(2)
+                    cname = urllib.parse.unquote(m.group(3))
+                    cname = re.sub(r'\.\w+$', '', cname)  # strip extension
+                    result['cursors'].append({
+                        'name': cname,
+                        'preview_url': f'{base}/cursor-view/{cid}.png',
+                        'dl_url': base + m.group(1),
+                    })
+            elif 'Cursors-4u' in self.source_name or 'cursors-4u' in self.set_url:
+                # Cursors-4u detail page
+                tm = re.search(r'<h1[^>]*>([^<]+)</h1>', raw)
+                result['title'] = html_mod.unescape(tm.group(1)).strip() if tm else 'Cursor'
+                am = re.search(r'class="creator-name"[^>]*>([^<]+)<', raw)
+                if not am:
+                    am = re.search(r'CREATOR.*?<a[^>]*>([^<]+)</a>', raw, re.DOTALL | re.I)
+                result['author'] = html_mod.unescape(am.group(1)).strip() if am else ''
+                # Preview images from CDN
+                img_pattern = re.compile(
+                    r'<img[^>]+src="(https://cdn\.cursors-4u\.net/[^"]+)"[^>]*'
+                    r'(?:alt="([^"]*)")?', re.I)
+                for m in img_pattern.finditer(raw):
+                    name = html_mod.unescape(m.group(2)).strip() if m.group(2) else 'Cursor'
+                    result['cursors'].append({
+                        'name': name,
+                        'preview_url': m.group(1),
+                        'dl_url': '',
+                    })
+            else:
+                # VSThemes detail page
+                tm = re.search(r'<h1[^>]*>(.*?)</h1>', raw, re.DOTALL)
+                if tm:
+                    result['title'] = re.sub(r'<[^>]+>', '', html_mod.unescape(tm.group(1))).strip()
+                else:
+                    result['title'] = 'Cursor Pack'
+                am = re.search(r'class="[^"]*author[^"]*"[^>]*>([^<]+)<', raw, re.I)
+                result['author'] = html_mod.unescape(am.group(1)).strip() if am else ''
+                # Preview images - find large screenshots
+                img_pattern = re.compile(
+                    r'<img[^>]+src="(https?://[^"]*(?:uploads|screens|preview)[^"]*)"[^>]*'
+                    r'(?:alt="([^"]*)")?', re.I)
+                for m in img_pattern.finditer(raw):
+                    name = html_mod.unescape(m.group(2)).strip() if m.group(2) else 'Preview'
+                    result['cursors'].append({
+                        'name': name,
+                        'preview_url': m.group(1),
+                        'dl_url': '',
+                    })
+                # Download link
+                dl_m = re.search(r'href="(/engine/download[^"]+)"', raw, re.I)
+                if dl_m:
+                    result['zip_url'] = 'https://vsthemes.org' + dl_m.group(1)
+
+            self.detail_ready.emit(result)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class CursorDetailDialog(QDialog):
+    """Shows all individual cursors in a pack with previews and download buttons."""
+    archive_downloaded = pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(520, 620)
+        self._drag_origin = None
+        self._img_loaders = []
+        self._dl_threads  = []
+        self._build_ui()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self); outer.setContentsMargins(14, 14, 14, 14)
+        panel = QWidget(); panel.setObjectName('DetailPanel')
+        panel.setStyleSheet(
+            'QWidget#DetailPanel{background:rgba(12,12,16,250);'
+            'border-radius:18px;border:1px solid rgba(255,255,255,25);}')
+        glow = QGraphicsDropShadowEffect()
+        glow.setColor(QColor(255, 255, 255, 35)); glow.setBlurRadius(36); glow.setOffset(0, 0)
+        panel.setGraphicsEffect(glow)
+        lay = QVBoxLayout(panel); lay.setContentsMargins(20, 14, 20, 16); lay.setSpacing(8)
+
+        # Title row
+        tr = QHBoxLayout()
+        self._title_lbl = QLabel('Loading...')
+        self._title_lbl.setFont(QFont('Segoe UI', 13, QFont.Bold))
+        self._title_lbl.setStyleSheet('color:#fff;background:transparent;')
+        close_btn = QPushButton('X'); close_btn.setFixedSize(28, 28)
+        close_btn.setFont(QFont('Segoe UI', 9, QFont.Bold))
+        close_btn.setStyleSheet(
+            'QPushButton{color:rgba(200,80,80,180);background:transparent;'
+            'border:1px solid rgba(200,80,80,50);border-radius:7px;}'
+            'QPushButton:hover{color:#ff5555;border-color:#ff5555;}')
+        close_btn.clicked.connect(self.close)
+        tr.addWidget(self._title_lbl); tr.addStretch(); tr.addWidget(close_btn)
+        lay.addLayout(tr)
+
+        # Author / info
+        self._author_lbl = QLabel('')
+        self._author_lbl.setFont(QFont('Segoe UI', 9))
+        self._author_lbl.setStyleSheet('color:rgba(180,200,255,180);background:transparent;')
+        lay.addWidget(self._author_lbl)
+
+        # Download all button
+        self._dl_all_btn = QPushButton('DOWNLOAD FULL PACK')
+        self._dl_all_btn.setFont(QFont('Segoe UI', 10, QFont.Bold))
+        self._dl_all_btn.setFixedHeight(38)
+        self._dl_all_btn.setStyleSheet(
+            'QPushButton{color:#000;background:#fff;border:none;border-radius:10px;letter-spacing:1px;}'
+            'QPushButton:hover{background:#d0d0d0;}'
+            'QPushButton:disabled{color:#888;background:rgba(255,255,255,40);}')
+        self._dl_all_btn.hide()
+        lay.addWidget(self._dl_all_btn)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet('color:rgba(255,255,255,12);')
+        lay.addWidget(sep)
+
+        # Cursor count
+        self._count_lbl = QLabel('')
+        self._count_lbl.setFont(QFont('Segoe UI', 8))
+        self._count_lbl.setStyleSheet('color:rgba(255,255,255,40);background:transparent;letter-spacing:1px;')
+        lay.addWidget(self._count_lbl)
+
+        # Scrollable grid of individual cursors
+        gw = QWidget(); gw.setStyleSheet('background:transparent;')
+        self._grid = QGridLayout(gw)
+        self._grid.setContentsMargins(4, 4, 4, 4); self._grid.setSpacing(8)
+        scroll = QScrollArea(); scroll.setWidget(gw); scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            'QScrollArea{background:rgba(255,255,255,3);border:1px solid rgba(255,255,255,10);border-radius:10px;}'
+            'QScrollBar:vertical{background:rgba(255,255,255,5);width:6px;border-radius:3px;}'
+            'QScrollBar::handle:vertical{background:rgba(255,255,255,50);border-radius:3px;min-height:30px;}'
+            'QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}')
+        lay.addWidget(scroll, 1)
+
+        # Loading
+        self._loading_lbl = QLabel('Loading cursor details...')
+        self._loading_lbl.setFont(QFont('Segoe UI', 9))
+        self._loading_lbl.setAlignment(Qt.AlignCenter)
+        self._loading_lbl.setStyleSheet('color:rgba(255,255,255,60);background:transparent;')
+        lay.addWidget(self._loading_lbl)
+
+        outer.addWidget(panel)
+
+    def load_from_url(self, url, source_name, title=''):
+        """Start loading cursor details from a URL."""
+        self._title_lbl.setText(title or 'Loading...')
+        self._detail_thread = _CursorDetailThread(url, source_name)
+        self._detail_thread.detail_ready.connect(self._on_detail)
+        self._detail_thread.error.connect(self._on_error)
+        self._detail_thread.start()
+
+    def _on_error(self, msg):
+        self._loading_lbl.setText(f'Error: {msg}')
+        self._loading_lbl.setStyleSheet('color:rgba(255,100,100,180);background:transparent;')
+
+    def _on_detail(self, data):
+        self._loading_lbl.hide()
+        self._title_lbl.setText(data.get('title', 'Cursor Set'))
+        author = data.get('author', '')
+        if author:
+            self._author_lbl.setText(f'by {author}')
+        cursors = data.get('cursors', [])
+        self._count_lbl.setText(f'{len(cursors)} CURSOR{"S" if len(cursors) != 1 else ""} IN THIS PACK')
+
+        zip_url = data.get('zip_url', '')
+        if zip_url:
+            self._dl_all_btn.show()
+            self._dl_all_btn.clicked.connect(
+                lambda: self._download_zip(zip_url, data.get('title', 'cursors')))
+
+        cols = 4
+        for i, c in enumerate(cursors):
+            card = self._make_cursor_card(c)
+            self._grid.addWidget(card, i // cols, i % cols)
+            # Load preview
+            url = c.get('preview_url', '')
+            if url:
+                loader = _ImageLoaderThread(url)
+                loader.image_ready.connect(self._on_thumb_loaded)
+                loader.finished.connect(lambda ldr=loader: self._cleanup_loader(ldr))
+                self._img_loaders.append(loader)
+                loader.start()
+
+    def _make_cursor_card(self, cursor_info):
+        from PyQt5.QtGui import QPixmap
+        card = QWidget(); card.setFixedSize(108, 110)
+        card.setProperty('preview_url', cursor_info.get('preview_url', ''))
+        card.setStyleSheet(
+            'QWidget{background:rgba(255,255,255,5);border:1px solid rgba(255,255,255,12);border-radius:8px;}'
+            'QWidget:hover{background:rgba(255,255,255,10);border-color:rgba(255,255,255,30);}')
+        vl = QVBoxLayout(card); vl.setContentsMargins(6, 6, 6, 4); vl.setSpacing(3)
+        # Preview
+        thumb = QLabel(); thumb.setFixedSize(64, 64); thumb.setAlignment(Qt.AlignCenter)
+        thumb.setStyleSheet('background:rgba(255,255,255,5);border:1px solid rgba(255,255,255,8);'
+                           'border-radius:6px;color:rgba(255,255,255,25);')
+        thumb.setText('...')
+        thumb.setFont(QFont('Segoe UI', 7))
+        card.setProperty('thumb_label', thumb)
+        vl.addWidget(thumb, 0, Qt.AlignCenter)
+        # Name
+        name = QLabel(cursor_info.get('name', ''))
+        name.setFont(QFont('Segoe UI', 7))
+        name.setStyleSheet('color:rgba(255,255,255,160);background:transparent;border:none;')
+        name.setAlignment(Qt.AlignCenter); name.setWordWrap(True); name.setMaximumHeight(22)
+        vl.addWidget(name)
+        return card
+
+    def _on_thumb_loaded(self, url, data):
+        from PyQt5.QtGui import QPixmap
+        pixmap = QPixmap(); pixmap.loadFromData(data)
+        if pixmap.isNull():
+            return
+        pixmap = pixmap.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        for i in range(self._grid.count()):
+            item = self._grid.itemAt(i)
+            if item and item.widget():
+                card = item.widget()
+                if card.property('preview_url') == url:
+                    lbl = card.property('thumb_label')
+                    if lbl:
+                        lbl.setPixmap(pixmap); lbl.setText('')
+
+    def _cleanup_loader(self, t):
+        try: self._img_loaders.remove(t)
+        except ValueError: pass
+        t.deleteLater()
+
+    def _download_zip(self, url, title):
+        self._dl_all_btn.setEnabled(False)
+        self._dl_all_btn.setText('Downloading...')
+        thread = _CursorDownloadThread(url, title)
+        thread.finished_ok.connect(self._on_dl_ok)
+        thread.finished_err.connect(self._on_dl_err)
+        thread.finished.connect(lambda thr=thread: self._cleanup_dl(thr))
+        self._dl_threads.append(thread)
+        thread.start()
+
+    def _on_dl_ok(self, path):
+        self._dl_all_btn.setText('Added to queue!')
+        self._dl_all_btn.setStyleSheet(
+            'QPushButton{color:#fff;background:rgba(0,200,100,180);border:none;'
+            'border-radius:10px;letter-spacing:1px;}')
+        self.archive_downloaded.emit([path])
+
+    def _on_dl_err(self, err):
+        self._dl_all_btn.setEnabled(True)
+        self._dl_all_btn.setText('RETRY DOWNLOAD')
+
+    def _cleanup_dl(self, t):
+        try: self._dl_threads.remove(t)
+        except ValueError: pass
+        t.deleteLater()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_origin = e.globalPos() - self.frameGeometry().topLeft()
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.LeftButton and self._drag_origin:
+            self.move(e.globalPos() - self._drag_origin)
+    def mouseReleaseEvent(self, e): self._drag_origin = None
+    def paintEvent(self, _): pass
+    def closeEvent(self, e):
+        for t in self._img_loaders[:]: t.quit()
+        for t in self._dl_threads[:]: t.quit()
+        super().closeEvent(e)
+
+
+class CursorBrowseDialog(QDialog):
+    """Full-screen gallery showing cursor images scraped from cursor sites."""
+    archive_downloaded = pyqtSignal(list)   # [path_to_zip] – fed to MainWindow
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setFixedSize(620, 760)
+        self._drag_origin = None
+        self._current_source_idx = 0
+        self._current_page = 0
+        self._current_cat_idx = 0     # category within current source
+        self._total_pages = 100       # updated dynamically from scraper
+        self._scrapers = []
+        self._img_loaders = []
+        self._dl_threads = []
+        self._thumb_cache = {}
+        self._gallery_items = []
+        self._build_ui()
+        self._load_page()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 14, 14, 14)
+
+        panel = QWidget()
+        panel.setObjectName('BrowsePanel')
+        panel.setStyleSheet(
+            'QWidget#BrowsePanel{background:rgba(12,12,16,250);'
+            'border-radius:18px;border:1px solid rgba(255,255,255,25);}')
+        glow = QGraphicsDropShadowEffect()
+        glow.setColor(QColor(255, 255, 255, 40))
+        glow.setBlurRadius(40); glow.setOffset(0, 0)
+        panel.setGraphicsEffect(glow)
+
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(20, 16, 20, 18); lay.setSpacing(10)
+
+        # ── Title bar ──
+        title_row = QHBoxLayout()
+        title = QLabel('Browse Cursors')
+        title.setFont(QFont('Segoe UI', 14, QFont.Bold))
+        title.setStyleSheet('color:#ffffff;background:transparent;')
+        close_btn = QPushButton('X'); close_btn.setFixedSize(28, 28)
+        close_btn.setFont(QFont('Segoe UI', 9, QFont.Bold))
+        close_btn.setStyleSheet(
+            'QPushButton{color:rgba(200,80,80,180);background:transparent;'
+            'border:1px solid rgba(200,80,80,50);border-radius:7px;}'
+            'QPushButton:hover{color:#ff5555;border-color:#ff5555;background:rgba(255,60,60,20);}')
+        close_btn.clicked.connect(self.close)
+        title_row.addWidget(title); title_row.addStretch(); title_row.addWidget(close_btn)
+        lay.addLayout(title_row)
+
+        # ── Site credit banner ──
+        self._credit_lbl = QLabel()
+        self._credit_lbl.setFont(QFont('Segoe UI', 9))
+        self._credit_lbl.setAlignment(Qt.AlignCenter)
+        self._credit_lbl.setStyleSheet(
+            'color:rgba(180,220,255,200);background:rgba(60,120,220,25);'
+            'border:1px solid rgba(80,140,255,40);border-radius:8px;'
+            'padding:6px 10px;')
+        self._credit_lbl.setOpenExternalLinks(True)
+        self._credit_lbl.setTextFormat(Qt.RichText)
+        lay.addWidget(self._credit_lbl)
+
+        # ── Source tabs ──
+        tab_row = QHBoxLayout(); tab_row.setSpacing(6)
+        self._source_btns = []
+        for i, src in enumerate(_GALLERY_SOURCES):
+            btn = QPushButton(src['name'])
+            btn.setFont(QFont('Segoe UI', 9, QFont.Bold))
+            btn.setFixedHeight(30); btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda checked, idx=i: self._switch_source(idx))
+            self._source_btns.append(btn)
+            tab_row.addWidget(btn)
+        lay.addLayout(tab_row)
+        self._update_tab_styles()
+
+        # ── Category filter row (scrollable for many categories) ──
+        cat_row = QHBoxLayout(); cat_row.setSpacing(5)
+        cat_label = QLabel('Filter:')
+        cat_label.setFont(QFont('Segoe UI', 8))
+        cat_label.setStyleSheet('color:rgba(255,255,255,80);background:transparent;')
+        cat_row.addWidget(cat_label)
+        self._cat_btns = []
+        self._cat_container = QWidget()
+        self._cat_container.setStyleSheet('background:transparent;')
+        self._cat_layout = QHBoxLayout(self._cat_container)
+        self._cat_layout.setContentsMargins(0, 0, 0, 0); self._cat_layout.setSpacing(4)
+        cat_scroll = QScrollArea()
+        cat_scroll.setWidget(self._cat_container)
+        cat_scroll.setWidgetResizable(True)
+        cat_scroll.setFixedHeight(34)
+        cat_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        cat_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        cat_scroll.setStyleSheet(
+            'QScrollArea{background:transparent;border:none;}'
+            'QScrollBar{height:0;width:0;}')
+        cat_row.addWidget(cat_scroll, 1)
+        lay.addLayout(cat_row)
+        self._rebuild_category_buttons()
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet('color:rgba(255,255,255,15);')
+        lay.addWidget(sep)
+
+        # ── Search bar ──
+        search_row = QHBoxLayout(); search_row.setSpacing(6)
+        self._search_input = QLineEdit()
+        self._search_input.setPlaceholderText('Search cursors on RW-Designer...')
+        self._search_input.setFont(QFont('Segoe UI', 9))
+        self._search_input.setFixedHeight(30)
+        self._search_input.setStyleSheet(
+            'QLineEdit{color:#fff;background:rgba(255,255,255,6);'
+            'border:1px solid rgba(255,255,255,20);border-radius:8px;padding:0 10px;}'
+            'QLineEdit:focus{border-color:rgba(255,255,255,50);}')
+        self._search_input.returnPressed.connect(self._do_search)
+        search_btn = QPushButton('Search')
+        search_btn.setFont(QFont('Segoe UI', 8, QFont.Bold))
+        search_btn.setFixedSize(60, 30)
+        search_btn.setStyleSheet(
+            'QPushButton{color:#000;background:#fff;border:none;border-radius:8px;}'
+            'QPushButton:hover{background:#d0d0d0;}')
+        search_btn.clicked.connect(self._do_search)
+        search_row.addWidget(self._search_input, 1)
+        search_row.addWidget(search_btn)
+        lay.addLayout(search_row)
+
+        # ── Loading / status indicator ──
+        self._loading_lbl = QLabel('Loading cursors...')
+        self._loading_lbl.setFont(QFont('Segoe UI', 10))
+        self._loading_lbl.setAlignment(Qt.AlignCenter)
+        self._loading_lbl.setStyleSheet('color:rgba(255,255,255,80);background:transparent;')
+        lay.addWidget(self._loading_lbl)
+
+        # ── Scrollable gallery grid ──
+        self._gallery_widget = QWidget()
+        self._gallery_widget.setStyleSheet('background:transparent;')
+        self._gallery_grid = QGridLayout(self._gallery_widget)
+        self._gallery_grid.setContentsMargins(4, 4, 4, 4)
+        self._gallery_grid.setSpacing(10)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidget(self._gallery_widget)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet(
+            'QScrollArea{background:rgba(255,255,255,3);border:1px solid rgba(255,255,255,10);border-radius:10px;}'
+            'QScrollBar:vertical{background:rgba(255,255,255,5);width:6px;border-radius:3px;}'
+            'QScrollBar::handle:vertical{background:rgba(255,255,255,50);border-radius:3px;min-height:30px;}'
+            'QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}')
+        lay.addWidget(self._scroll, 1)
+
+        # ── Pagination ──
+        page_row = QHBoxLayout(); page_row.setSpacing(10)
+        self._prev_btn = QPushButton('< Prev')
+        self._prev_btn.setFont(QFont('Segoe UI', 9, QFont.Bold))
+        self._prev_btn.setFixedHeight(30); self._prev_btn.setEnabled(False)
+        self._prev_btn.setStyleSheet(self._page_btn_style())
+        self._prev_btn.clicked.connect(self._prev_page)
+
+        self._page_lbl = QLabel('Page 1')
+        self._page_lbl.setFont(QFont('Segoe UI', 9))
+        self._page_lbl.setAlignment(Qt.AlignCenter)
+        self._page_lbl.setStyleSheet('color:rgba(255,255,255,120);background:transparent;')
+
+        self._next_btn = QPushButton('Next >')
+        self._next_btn.setFont(QFont('Segoe UI', 9, QFont.Bold))
+        self._next_btn.setFixedHeight(30)
+        self._next_btn.setStyleSheet(self._page_btn_style())
+        self._next_btn.clicked.connect(self._next_page)
+
+        # Page jump input
+        self._page_input = QLineEdit()
+        self._page_input.setPlaceholderText('#')
+        self._page_input.setFont(QFont('Segoe UI', 8))
+        self._page_input.setFixedSize(42, 26)
+        self._page_input.setAlignment(Qt.AlignCenter)
+        self._page_input.setStyleSheet(
+            'QLineEdit{color:#fff;background:rgba(255,255,255,8);'
+            'border:1px solid rgba(255,255,255,20);border-radius:6px;padding:0 4px;}'
+            'QLineEdit:focus{border-color:rgba(255,255,255,50);}')
+        self._page_input.returnPressed.connect(self._jump_to_page)
+        go_btn = QPushButton('Go')
+        go_btn.setFont(QFont('Segoe UI', 7, QFont.Bold))
+        go_btn.setFixedSize(30, 26)
+        go_btn.setStyleSheet(
+            'QPushButton{color:#000;background:#fff;border:none;border-radius:6px;}'
+            'QPushButton:hover{background:#d0d0d0;}')
+        go_btn.clicked.connect(self._jump_to_page)
+
+        self._total_lbl = QLabel('')
+        self._total_lbl.setFont(QFont('Segoe UI', 8))
+        self._total_lbl.setStyleSheet('color:rgba(255,255,255,60);background:transparent;')
+
+        page_row.addWidget(self._prev_btn)
+        page_row.addStretch()
+        page_row.addWidget(self._page_lbl)
+        page_row.addWidget(self._page_input)
+        page_row.addWidget(go_btn)
+        page_row.addWidget(self._total_lbl)
+        page_row.addStretch()
+        page_row.addWidget(self._next_btn)
+        lay.addLayout(page_row)
+
+        outer.addWidget(panel)
+
+    @staticmethod
+    def _page_btn_style():
+        return (
+            'QPushButton{color:rgba(200,200,200,180);background:rgba(255,255,255,8);'
+            'border:1px solid rgba(255,255,255,25);border-radius:8px;padding:0 14px;}'
+            'QPushButton:hover{color:#ffffff;background:rgba(255,255,255,15);'
+            'border-color:rgba(255,255,255,50);}'
+            'QPushButton:disabled{color:rgba(100,100,100,60);'
+            'border-color:rgba(255,255,255,10);background:rgba(255,255,255,3);}')
+
+    def _update_tab_styles(self):
+        for i, btn in enumerate(self._source_btns):
+            if i == self._current_source_idx:
+                btn.setStyleSheet(
+                    'QPushButton{color:#ffffff;background:rgba(255,255,255,15);'
+                    'border:1px solid rgba(255,255,255,50);border-radius:8px;padding:0 14px;}'
+                    'QPushButton:hover{background:rgba(255,255,255,20);}')
+            else:
+                btn.setStyleSheet(
+                    'QPushButton{color:rgba(180,180,180,150);background:rgba(255,255,255,5);'
+                    'border:1px solid rgba(255,255,255,15);border-radius:8px;padding:0 14px;}'
+                    'QPushButton:hover{color:#ffffff;background:rgba(255,255,255,10);}')
+
+    def _rebuild_category_buttons(self):
+        """Rebuild the category filter buttons for the current source."""
+        # Clear old buttons
+        for b in self._cat_btns:
+            b.deleteLater()
+        self._cat_btns.clear()
+        src = _GALLERY_SOURCES[self._current_source_idx]
+        cats = src.get('categories', [])
+        for i, (label, _path) in enumerate(cats):
+            btn = QPushButton(label)
+            btn.setFont(QFont('Segoe UI', 7, QFont.Bold))
+            btn.setFixedHeight(24); btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda checked, idx=i: self._switch_category(idx))
+            self._cat_btns.append(btn)
+            self._cat_layout.addWidget(btn)
+        self._update_cat_styles()
+
+    def _update_cat_styles(self):
+        active_ss = ('QPushButton{color:#fff;background:rgba(100,160,255,60);'
+                     'border:1px solid rgba(100,160,255,100);border-radius:6px;padding:0 10px;}'
+                     'QPushButton:hover{background:rgba(100,160,255,80);}')
+        normal_ss = ('QPushButton{color:rgba(180,180,180,140);background:rgba(255,255,255,5);'
+                     'border:1px solid rgba(255,255,255,12);border-radius:6px;padding:0 10px;}'
+                     'QPushButton:hover{color:#fff;background:rgba(255,255,255,10);}')
+        for i, btn in enumerate(self._cat_btns):
+            btn.setStyleSheet(active_ss if i == self._current_cat_idx else normal_ss)
+
+    def _switch_category(self, idx):
+        if idx == self._current_cat_idx:
+            return
+        self._current_cat_idx = idx
+        self._current_page = 0
+        self._total_pages = 100  # reset until discovered
+        self._update_cat_styles()
+        self._load_page()
+
+    def _current_category_path(self):
+        """Return the URL path for the currently selected category."""
+        src = _GALLERY_SOURCES[self._current_source_idx]
+        cats = src.get('categories', [])
+        if cats and self._current_cat_idx < len(cats):
+            return cats[self._current_cat_idx][1]
+        return cats[0][1] if cats else ''
+
+    def _update_credit(self):
+        src = _GALLERY_SOURCES[self._current_source_idx]
+        site_url = src['base']
+        self._credit_lbl.setText(
+            f'All cursors by <b><a href="{site_url}" '
+            f'style="color:#7db8ff;text-decoration:none;">{src["name"]}</a></b>'
+            f'  —  credit to the original creators')
+
+    def _switch_source(self, idx):
+        if idx == self._current_source_idx:
+            return
+        self._current_source_idx = idx
+        self._current_page = 0
+        self._current_cat_idx = 0
+        self._total_pages = 100
+        self._update_tab_styles()
+        self._rebuild_category_buttons()
+        self._load_page()
+
+    def _prev_page(self):
+        if self._current_page > 0:
+            self._current_page -= 1
+            self._load_page()
+
+    def _next_page(self):
+        if self._current_page + 1 < self._total_pages:
+            self._current_page += 1
+            self._load_page()
+
+    def _jump_to_page(self):
+        """Jump to the page number entered by the user."""
+        try:
+            pg = int(self._page_input.text().strip()) - 1  # 0-indexed internally
+            if pg < 0:
+                pg = 0
+            if pg >= self._total_pages:
+                pg = self._total_pages - 1
+            self._current_page = pg
+            self._load_page()
+            self._page_input.clear()
+        except ValueError:
+            pass
+
+    def _do_search(self):
+        """Filter currently loaded cursors by search term, or re-load with filter."""
+        query = self._search_input.text().strip().lower()
+        if not query:
+            self._load_page()
+            return
+
+        if not self._gallery_items:
+            self._loading_lbl.setText('Load a page first, then search')
+            self._loading_lbl.setStyleSheet('color:rgba(255,200,80,150);background:transparent;')
+            self._loading_lbl.show()
+            return
+
+        filtered = [it for it in self._gallery_items if query in it['title'].lower()]
+        self._clear_grid()
+        if not filtered:
+            self._loading_lbl.setText(f'No results for "{query}" on this page — try other pages')
+            self._loading_lbl.setStyleSheet('color:rgba(255,200,80,150);background:transparent;')
+            self._loading_lbl.show()
+            return
+
+        self._loading_lbl.setText(f'{len(filtered)} matches for "{query}"')
+        self._loading_lbl.setStyleSheet('color:rgba(140,200,255,180);background:transparent;')
+        self._loading_lbl.show()
+
+        cols = 3
+        for i, item in enumerate(filtered):
+            card = self._make_card(item)
+            self._gallery_grid.addWidget(card, i // cols, i % cols)
+        for item in filtered:
+            url = item['thumb_url']
+            if url in self._thumb_cache:
+                self._set_thumb(url, self._thumb_cache[url])
+            else:
+                loader = _ImageLoaderThread(url)
+                loader.image_ready.connect(self._on_thumb_loaded)
+                loader.finished.connect(lambda ldr=loader: self._cleanup_img_loader(ldr))
+                self._img_loaders.append(loader)
+                loader.start()
+
+    def _on_page_info(self, total):
+        """Called when the scraper discovers total page count."""
+        self._total_pages = total
+        self._total_lbl.setText(f'of ~{total}')
+        self._next_btn.setEnabled(self._current_page + 1 < total)
+
+    def _update_page_ui(self):
+        """Refresh all pagination display elements."""
+        page_text  = f'Page {self._current_page + 1}'
+        total_text = f'of ~{self._total_pages}'
+        self._page_lbl.setText(page_text)
+        self._total_lbl.setText(total_text)
+        self._prev_btn.setEnabled(self._current_page > 0)
+        self._next_btn.setEnabled(self._current_page + 1 < self._total_pages)
+        # Force immediate repaint — schedule via timer so the event loop processes it
+        QTimer.singleShot(0, lambda: (
+            self._page_lbl.setText(page_text),
+            self._page_lbl.update(),
+            self._total_lbl.update(),
+            self._prev_btn.update(),
+            self._next_btn.update(),
+        ))
+
+    def _load_page(self):
+        self._update_credit()
+        self._loading_lbl.setText('Loading cursors...')
+        self._loading_lbl.setStyleSheet('color:rgba(255,255,255,80);background:transparent;')
+        self._loading_lbl.show()
+        self._update_page_ui()
+        # Update search placeholder based on source
+        src = _GALLERY_SOURCES[self._current_source_idx]
+        self._search_input.setPlaceholderText(f'Search cursors on {src["name"]}...')
+        self._clear_grid()
+        self._gallery_items.clear()
+        # Scroll back to top
+        self._scroll.verticalScrollBar().setValue(0)
+
+        cat_path = self._current_category_path()
+        scraper = _GalleryScraperThread(src, self._current_page, cat_path)
+        scraper.items_ready.connect(self._on_items_ready)
+        scraper.page_info.connect(self._on_page_info)
+        scraper.error.connect(self._on_scrape_error)
+        scraper.finished.connect(lambda: self._cleanup_thread(scraper))
+        self._scrapers.append(scraper)
+        scraper.start()
+
+    def _clear_grid(self):
+        while self._gallery_grid.count():
+            item = self._gallery_grid.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+    def _cleanup_thread(self, t):
+        try:
+            self._scrapers.remove(t)
+        except ValueError:
+            pass
+        t.deleteLater()
+
+    def _on_scrape_error(self, name, msg):
+        self._loading_lbl.setText(f'Could not load from {name}: {msg}')
+        self._loading_lbl.setStyleSheet('color:rgba(255,100,100,180);background:transparent;')
+        self._next_btn.setEnabled(False)
+
+    def _on_items_ready(self, name, items):
+        self._loading_lbl.hide()
+        if not items:
+            self._loading_lbl.setText('No cursors found on this page')
+            self._loading_lbl.setStyleSheet('color:rgba(255,200,80,150);background:transparent;')
+            self._loading_lbl.show()
+            self._next_btn.setEnabled(False)
+            return
+
+        # If we got very few items, we're likely at the last page
+        if len(items) < 3:
+            self._next_btn.setEnabled(False)
+        else:
+            self._next_btn.setEnabled(self._current_page + 1 < self._total_pages)
+        self._gallery_items = items
+        cols = 3
+        for i, item in enumerate(items):
+            card = self._make_card(item)
+            self._gallery_grid.addWidget(card, i // cols, i % cols)
+
+        # "Visit site for more" prompt below the grid
+        src = _GALLERY_SOURCES[self._current_source_idx]
+        row_after = (len(items) // cols) + 1
+        visit_lbl = QLabel(
+            f'Want to see more?  Visit <a href="{src["base"]}" '
+            f'style="color:#7db8ff;text-decoration:none;font-weight:bold;">'
+            f'{src["name"]}</a> for the full collection')
+        visit_lbl.setFont(QFont('Segoe UI', 8))
+        visit_lbl.setAlignment(Qt.AlignCenter)
+        visit_lbl.setStyleSheet(
+            'color:rgba(180,200,255,140);background:rgba(60,120,220,12);'
+            'border:1px solid rgba(80,140,255,20);border-radius:8px;'
+            'padding:8px 12px;')
+        visit_lbl.setOpenExternalLinks(True)
+        visit_lbl.setTextFormat(Qt.RichText)
+        self._gallery_grid.addWidget(visit_lbl, row_after, 0, 1, cols)
+
+        # Start loading thumbnails
+        for item in items:
+            url = item['thumb_url']
+            if url in self._thumb_cache:
+                self._set_thumb(url, self._thumb_cache[url])
+            else:
+                loader = _ImageLoaderThread(url)
+                loader.image_ready.connect(self._on_thumb_loaded)
+                loader.finished.connect(lambda ldr=loader: self._cleanup_img_loader(ldr))
+                self._img_loaders.append(loader)
+                loader.start()
+
+    def _cleanup_img_loader(self, t):
+        try:
+            self._img_loaders.remove(t)
+        except ValueError:
+            pass
+        t.deleteLater()
+
+    def _make_card(self, item):
+        """Create a single cursor gallery card with thumbnail and download button."""
+        from PyQt5.QtGui import QPixmap
+        card = QWidget()
+        card.setFixedSize(176, 190)
+        card.setProperty('thumb_url', item['thumb_url'])
+        card.setProperty('link', item['link'])
+        card.setStyleSheet(
+            'QWidget{background:rgba(255,255,255,5);'
+            'border:1px solid rgba(255,255,255,15);border-radius:10px;}'
+            'QWidget:hover{background:rgba(255,255,255,10);'
+            'border-color:rgba(255,255,255,35);}')
+
+        vlay = QVBoxLayout(card)
+        vlay.setContentsMargins(8, 8, 8, 6)
+        vlay.setSpacing(4)
+
+        # Thumbnail placeholder
+        thumb_lbl = QLabel()
+        thumb_lbl.setFixedSize(160, 100)
+        thumb_lbl.setAlignment(Qt.AlignCenter)
+        thumb_lbl.setStyleSheet(
+            'background:rgba(255,255,255,5);border:1px solid rgba(255,255,255,8);'
+            'border-radius:6px;color:rgba(255,255,255,30);')
+        thumb_lbl.setText('Loading...')
+        thumb_lbl.setFont(QFont('Segoe UI', 8))
+        card.setProperty('thumb_label', thumb_lbl)
+        vlay.addWidget(thumb_lbl, 0, Qt.AlignCenter)
+
+        # Title
+        title_lbl = QLabel(item['title'])
+        title_lbl.setFont(QFont('Segoe UI', 8, QFont.Bold))
+        title_lbl.setStyleSheet('color:rgba(255,255,255,200);background:transparent;border:none;')
+        title_lbl.setAlignment(Qt.AlignCenter)
+        title_lbl.setWordWrap(True)
+        title_lbl.setMaximumHeight(26)
+        vlay.addWidget(title_lbl)
+
+        # Button row: Download + Open
+        btn_row = QHBoxLayout(); btn_row.setSpacing(4)
+
+        dl_url = item.get('download_url')
+        if dl_url:
+            dl_btn = QPushButton('Download')
+            dl_btn.setFont(QFont('Segoe UI', 7, QFont.Bold))
+            dl_btn.setFixedHeight(24); dl_btn.setCursor(Qt.PointingHandCursor)
+            dl_btn.setStyleSheet(
+                'QPushButton{color:#000;background:#ffffff;border:none;'
+                'border-radius:6px;padding:0 8px;}'
+                'QPushButton:hover{background:#d0d0d0;}'
+                'QPushButton:disabled{color:#888;background:rgba(255,255,255,40);}')
+            dl_btn.clicked.connect(
+                lambda checked, u=dl_url, t=item['title'], b=dl_btn:
+                    self._download_cursor(u, t, b))
+            btn_row.addWidget(dl_btn)
+        else:
+            # For sites without direct download, show "Open Site" button
+            open_btn = QPushButton('Open Site')
+            open_btn.setFont(QFont('Segoe UI', 7, QFont.Bold))
+            open_btn.setFixedHeight(24); open_btn.setCursor(Qt.PointingHandCursor)
+            open_btn.setStyleSheet(
+                'QPushButton{color:#000;background:#ffffff;border:none;'
+                'border-radius:6px;padding:0 8px;}'
+                'QPushButton:hover{background:#d0d0d0;}')
+            open_btn.clicked.connect(
+                lambda checked, url=item['link']: webbrowser.open(url))
+            btn_row.addWidget(open_btn)
+
+        view_btn = QPushButton('View')
+        view_btn.setFont(QFont('Segoe UI', 7))
+        view_btn.setFixedHeight(24); view_btn.setCursor(Qt.PointingHandCursor)
+        view_btn.setStyleSheet(
+            'QPushButton{color:rgba(200,200,200,180);background:rgba(255,255,255,8);'
+            'border:1px solid rgba(255,255,255,20);border-radius:6px;padding:0 8px;}'
+            'QPushButton:hover{color:#fff;border-color:rgba(255,255,255,40);}')
+        view_btn.clicked.connect(
+            lambda checked, url=item['link'], t=item['title']:
+                self._open_detail(url, t))
+        btn_row.addWidget(view_btn)
+
+        vlay.addLayout(btn_row)
+        return card
+
+    def _open_detail(self, url, title):
+        """Open the cursor detail viewer for a cursor set."""
+        src = _GALLERY_SOURCES[self._current_source_idx]
+        dlg = CursorDetailDialog(self)
+        dlg.archive_downloaded.connect(self.archive_downloaded.emit)
+        dlg.load_from_url(url, src['name'], title)
+        dlg.move(self.x() + (self.width() - dlg.width()) // 2, self.y() + 60)
+        dlg.exec_()
+
+    def _download_cursor(self, url, title, btn):
+        """Download a cursor zip pack and feed it to the main window."""
+        btn.setEnabled(False)
+        btn.setText('Downloading...')
+        self._loading_lbl.setText(f'Downloading {title}...')
+        self._loading_lbl.setStyleSheet('color:rgba(140,200,255,180);background:transparent;')
+        self._loading_lbl.show()
+
+        thread = _CursorDownloadThread(url, title)
+        thread.finished_ok.connect(lambda path, b=btn, t=title: self._on_dl_ok(path, b, t))
+        thread.finished_err.connect(lambda err, b=btn, t=title: self._on_dl_err(err, b, t))
+        thread.finished.connect(lambda thr=thread: self._cleanup_dl_thread(thr))
+        self._dl_threads.append(thread)
+        thread.start()
+
+    def _cleanup_dl_thread(self, t):
+        try:
+            self._dl_threads.remove(t)
+        except ValueError:
+            pass
+        t.deleteLater()
+
+    def _on_dl_ok(self, path, btn, title):
+        btn.setText('Added!')
+        btn.setStyleSheet(
+            'QPushButton{color:#fff;background:rgba(0,200,100,180);border:none;'
+            'border-radius:6px;padding:0 8px;}'
+            'QPushButton:disabled{color:#fff;background:rgba(0,200,100,120);}')
+        self._loading_lbl.setText(f'Downloaded {title} — added to install queue')
+        self._loading_lbl.setStyleSheet('color:rgba(80,230,130,200);background:transparent;')
+        self.archive_downloaded.emit([path])
+
+    def _on_dl_err(self, err, btn, title):
+        btn.setEnabled(True)
+        btn.setText('Retry')
+        self._loading_lbl.setText(f'Download failed: {err}')
+        self._loading_lbl.setStyleSheet('color:rgba(255,100,100,180);background:transparent;')
+
+    def _on_thumb_loaded(self, url, data):
+        self._thumb_cache[url] = data
+        self._set_thumb(url, data)
+
+    def _set_thumb(self, url, data):
+        from PyQt5.QtGui import QPixmap
+        try:
+            pixmap = QPixmap()
+            pixmap.loadFromData(data)
+            if pixmap.isNull():
+                return
+            pixmap = pixmap.scaled(160, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            for i in range(self._gallery_grid.count()):
+                item = self._gallery_grid.itemAt(i)
+                if item and item.widget():
+                    card = item.widget()
+                    if card.property('thumb_url') == url:
+                        thumb_lbl = card.property('thumb_label')
+                        if thumb_lbl and not thumb_lbl.isHidden():
+                            thumb_lbl.setPixmap(pixmap)
+                            thumb_lbl.setText('')
+        except Exception:
+            pass
+
+    # ── Drag support ──
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag_origin = e.globalPos() - self.frameGeometry().topLeft()
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.LeftButton and self._drag_origin:
+            self.move(e.globalPos() - self._drag_origin)
+    def mouseReleaseEvent(self, e):
+        self._drag_origin = None
+    def paintEvent(self, _):
+        pass
+
+    def closeEvent(self, e):
+        for t in self._scrapers[:]:
+            t.quit()
+        for t in self._img_loaders[:]:
+            t.quit()
+        for t in self._dl_threads[:]:
+            t.quit()
+        super().closeEvent(e)
+
+
+# =============================================================================
 #  Drop Zone  (dark theme)
 # =============================================================================
 class DropZone(QWidget):
@@ -2125,14 +3844,32 @@ class FileItem(QWidget):
         super().__init__(parent)
         self.filepath     = filepath
         self.from_archive = from_archive
-        self.setFixedHeight(44)
+        self.setFixedHeight(48)
         self.setAttribute(Qt.WA_StyledBackground, True)
         self._apply_style(False)
 
         lay = QHBoxLayout(self); lay.setContentsMargins(8,0,8,0); lay.setSpacing(7)
 
+        # Preview thumbnail
+        self._thumb = QLabel()
+        self._thumb.setFixedSize(32, 32)
+        self._thumb.setAlignment(Qt.AlignCenter)
+        self._thumb.setStyleSheet(
+            'color:rgba(255,255,255,40);background:rgba(255,255,255,5);'
+            'border:1px solid rgba(255,255,255,15);border-radius:4px;')
+        try:
+            pix = _cursor_to_pixmap(filepath, 32)
+            if pix and not pix.isNull():
+                self._thumb.setPixmap(pix)
+                self._thumb.setStyleSheet('background:transparent;border:none;')
+            else:
+                self._thumb.setText('?')
+        except Exception:
+            self._thumb.setText('?')
+        lay.addWidget(self._thumb)
+
         self._combo = QComboBox()
-        self._combo.setFixedWidth(220); self._combo.setFixedHeight(27)
+        self._combo.setFixedWidth(200); self._combo.setFixedHeight(27)
         self._combo.setStyleSheet(COMBO_STYLE)
         self._combo.addItem('-- assign type --', '')
         for key, display in CURSOR_ROLES:
@@ -2389,12 +4126,15 @@ class MainWindow(QMainWindow):
                 'QPushButton:hover{color:'+hc+';background:rgba(255,255,255,12);border-color:'+hc+';}')
             return b
         br_btn  = abtn('  Select Files...','rgba(255,255,255,160)','#ffffff','rgba(255,255,255,30)')
-        sit_btn = abtn('Find Online','rgba(180,180,180,180)','#ffffff','rgba(255,255,255,22)')
+        gal_btn = abtn('Browse Cursors','rgba(160,200,255,200)','#6db8ff','rgba(80,140,255,40)')
+        sit_btn = abtn('Sites','rgba(180,180,180,180)','#ffffff','rgba(255,255,255,22)')
         ai_btn  = abtn('AI Create','rgba(180,230,180,200)','#00e888','rgba(100,230,130,40)')
         br_btn.clicked.connect(self._browse)
+        gal_btn.clicked.connect(self._open_gallery)
         sit_btn.clicked.connect(self._open_sites)
         ai_btn.clicked.connect(self._open_creator)
-        btn_row.addWidget(br_btn); btn_row.addWidget(sit_btn); btn_row.addWidget(ai_btn)
+        btn_row.addWidget(br_btn); btn_row.addWidget(gal_btn)
+        btn_row.addWidget(sit_btn); btn_row.addWidget(ai_btn)
 
         # List header
         hdr_row = QHBoxLayout(); hdr_row.setContentsMargins(0,0,0,0); hdr_row.setSpacing(6)
@@ -2536,6 +4276,12 @@ class MainWindow(QMainWindow):
              'error':'rgba(255,78,88,200)'}
         self._status.setText(msg)
         self._status.setStyleSheet('color:'+c.get(mode,c['normal'])+';background:transparent;')
+
+    def _open_gallery(self):
+        dlg = CursorBrowseDialog(self)
+        dlg.archive_downloaded.connect(self._on_archives)
+        dlg.move(self.x() + (self.width() - dlg.width()) // 2, self.y() + 30)
+        dlg.exec_()
 
     def _open_sites(self):
         dlg = SitesDialog(self)
